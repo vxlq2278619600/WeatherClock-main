@@ -1,0 +1,7 @@
+{
+    "files.associations": {
+        "*.h": "c"
+    },
+    "files.autoGuessEncoding": true,
+    "files.encoding": "utf8"
+}
