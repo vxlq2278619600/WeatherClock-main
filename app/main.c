@@ -10,11 +10,21 @@
 #include "wifi.h"
 #include "page.h"
 #include "aht20.h"
+#include "esp_at.h"
+#include "rtc.h"
 
-#define ENABLE_LCD_SELF_TEST  0
-#define ENABLE_AHT20_LCD_TEST 1
-#define LCD_TEST_PAGE_DELAY_MS 1000
-#define AHT20_LCD_REFRESH_MS   2000
+#define ENABLE_LCD_SELF_TEST       0
+#define ENABLE_AHT20_LCD_TEST      0
+#define ENABLE_WIFI_SNTP_LCD_TEST  1
+
+#define LCD_TEST_PAGE_DELAY_MS         1000
+#define AHT20_LCD_REFRESH_MS           2000
+#define WIFI_TEST_LOOP_MS              1000
+#define WIFI_RETRY_DELAY_MS            3000
+#define WIFI_CONNECT_TIMEOUT_MS        15000
+#define SNTP_SYNC_TIMEOUT_MS           15000
+#define WIFI_TEST_AHT20_REFRESH_MS     5000
+#define WIFI_TEST_LINK_CHECK_MS        5000
 
 extern void board_lowlevel_init(void);
 extern void board_init(void);
@@ -126,12 +136,46 @@ static void AHT20_LCD_ShowData(int temperature_tenths, int humidity_tenths)
     ui_write_string(20, 286, "AHT20 OK", mkcolor(120, 255, 120), bg_color, &font20_maple_bold);
 }
 
+static bool aht20_read_tenths(bool *sensor_ready, int *temperature_tenths, int *humidity_tenths)
+{
+    float temperature = 0.0f;
+    float humidity = 0.0f;
+
+    if (!*sensor_ready)
+    {
+        *sensor_ready = aht20_init();
+        if (!*sensor_ready)
+        {
+            return false;
+        }
+    }
+
+    if (!aht20_start_measurement() || !aht20_wait_for_measurement())
+    {
+        *sensor_ready = false;
+        return false;
+    }
+
+    if (!aht20_read_measurement(&temperature, &humidity))
+    {
+        *sensor_ready = false;
+        return false;
+    }
+
+    *temperature_tenths = to_tenths(temperature);
+    *humidity_tenths = to_tenths(humidity);
+    return true;
+}
+
 static void AHT20_LCD_Test(void)
 {
     bool sensor_ready = false;
 
     while (1)
     {
+        int temperature_tenths = 0;
+        int humidity_tenths = 0;
+
         if (!sensor_ready)
         {
             sensor_ready = aht20_init();
@@ -144,40 +188,286 @@ static void AHT20_LCD_Test(void)
             }
         }
 
-        if (!aht20_start_measurement() || !aht20_wait_for_measurement())
+        if (!aht20_read_tenths(&sensor_ready, &temperature_tenths, &humidity_tenths))
         {
             printf("[AHT20] read failed\r\n");
             AHT20_LCD_ShowError("AHT20 ERROR", "Check Sensor");
-            sensor_ready = false;
             vTaskDelay(pdMS_TO_TICKS(AHT20_LCD_REFRESH_MS));
             continue;
         }
 
+        printf("[AHT20] Temp: %d.%d C, Humi: %d.%d %%\r\n",
+            temperature_tenths / 10, abs(temperature_tenths % 10),
+            humidity_tenths / 10, abs(humidity_tenths % 10));
+
+        AHT20_LCD_ShowData(temperature_tenths, humidity_tenths);
+        vTaskDelay(pdMS_TO_TICKS(AHT20_LCD_REFRESH_MS));
+    }
+}
+
+static void lcd_write_row(uint16_t y, uint16_t clear_height, const char *text, uint16_t color, const font_t *font)
+{
+    const uint16_t bg_color = 0x0000;
+
+    ui_fill_color(0, y, UI_WIDTH - 1, y + clear_height, bg_color);
+    ui_write_string(20, y, text, color, bg_color, font);
+}
+
+static void WiFi_SNTP_LCD_DrawTemplate(void)
+{
+    const uint16_t bg_color = 0x0000;
+    const uint16_t fg_color = 0xFFFF;
+
+    ui_fill_color(0, 0, UI_WIDTH - 1, UI_HEIGHT - 1, bg_color);
+    ui_write_string(20, 18, "Weather Clock", fg_color, bg_color, &font24_maple_bold);
+
+    lcd_write_row(68, 28, "WiFi: Idle", mkcolor(255, 255, 0), &font24_maple_bold);
+    lcd_write_row(102, 28, "SNTP: Idle", mkcolor(255, 255, 0), &font24_maple_bold);
+    lcd_write_row(140, 24, "Time:", fg_color, &font20_maple_bold);
+    lcd_write_row(170, 36, "--:--:--", mkcolor(0, 255, 234), &font32_maple_bold);
+    lcd_write_row(220, 24, "Date:", fg_color, &font20_maple_bold);
+    lcd_write_row(248, 28, "----/--/--", fg_color, &font24_maple_bold);
+    lcd_write_row(288, 24, "Indoor: --.- C  --.- %", mkcolor(120, 255, 120), &font20_maple_bold);
+}
+
+static void WiFi_SNTP_LCD_ShowWiFi(const char *status, uint16_t color)
+{
+    char line[48];
+    snprintf(line, sizeof(line), "WiFi: %s", status);
+    lcd_write_row(68, 28, line, color, &font24_maple_bold);
+}
+
+static void WiFi_SNTP_LCD_ShowSNTP(const char *status, uint16_t color)
+{
+    char line[48];
+    snprintf(line, sizeof(line), "SNTP: %s", status);
+    lcd_write_row(102, 28, line, color, &font24_maple_bold);
+}
+
+static void WiFi_SNTP_LCD_ShowTime(const rtc_date_time_t *date)
+{
+    char line[16];
+    snprintf(line, sizeof(line), "%02u:%02u:%02u", date->hour, date->minute, date->second);
+    lcd_write_row(170, 36, line, mkcolor(0, 255, 234), &font32_maple_bold);
+}
+
+static void WiFi_SNTP_LCD_ShowDate(const rtc_date_time_t *date)
+{
+    char line[24];
+    snprintf(line, sizeof(line), "%04u-%02u-%02u", date->year, date->month, date->day);
+    lcd_write_row(248, 28, line, 0xFFFF, &font24_maple_bold);
+}
+
+static void WiFi_SNTP_LCD_ShowIndoorError(void)
+{
+    lcd_write_row(288, 24, "Indoor: AHT20 ERROR", mkcolor(255, 80, 80), &font20_maple_bold);
+}
+
+static void WiFi_SNTP_LCD_ShowIndoorData(int temperature_tenths, int humidity_tenths)
+{
+    char temp_str[16];
+    char humi_str[16];
+    char line[48];
+
+    format_tenths(temp_str, sizeof(temp_str), temperature_tenths);
+    format_tenths(humi_str, sizeof(humi_str), humidity_tenths);
+    snprintf(line, sizeof(line), "Indoor: %s C  %s %%", temp_str, humi_str);
+    lcd_write_row(288, 24, line, mkcolor(120, 255, 120), &font20_maple_bold);
+}
+
+static bool sntp_sync_rtc(void)
+{
+    const TickType_t retry_ticks = pdMS_TO_TICKS(1000);
+    const TickType_t timeout_ticks = pdMS_TO_TICKS(SNTP_SYNC_TIMEOUT_MS);
+    TickType_t start_tick = xTaskGetTickCount();
+    esp_date_time_t esp_date = { 0 };
+    rtc_date_time_t rtc_date = { 0 };
+
+    printf("[SNTP] syncing...\r\n");
+    WiFi_SNTP_LCD_ShowSNTP("Syncing...", mkcolor(255, 255, 0));
+
+    while ((xTaskGetTickCount() - start_tick) < timeout_ticks)
+    {
+        if (esp_at_sntp_get_time(&esp_date) && esp_date.year >= 2000)
         {
-            float temperature = 0.0f;
-            float humidity = 0.0f;
-            int temperature_tenths;
-            int humidity_tenths;
+            rtc_date.year = esp_date.year;
+            rtc_date.month = esp_date.month;
+            rtc_date.day = esp_date.day;
+            rtc_date.hour = esp_date.hour;
+            rtc_date.minute = esp_date.minute;
+            rtc_date.second = esp_date.second;
+            rtc_date.weekday = esp_date.weekday;
+            rtc_set_time(&rtc_date);
 
-            if (!aht20_read_measurement(&temperature, &humidity))
-            {
-                printf("[AHT20] read failed\r\n");
-                AHT20_LCD_ShowError("AHT20 ERROR", "Check Sensor");
-                vTaskDelay(pdMS_TO_TICKS(AHT20_LCD_REFRESH_MS));
-                continue;
-            }
-
-            temperature_tenths = to_tenths(temperature);
-            humidity_tenths = to_tenths(humidity);
-
-            printf("[AHT20] Temp: %d.%d C, Humi: %d.%d %%\r\n",
-                temperature_tenths / 10, abs(temperature_tenths % 10),
-                humidity_tenths / 10, abs(humidity_tenths % 10));
-
-            AHT20_LCD_ShowData(temperature_tenths, humidity_tenths);
+            printf("[SNTP] sync ok: %04u-%02u-%02u %02u:%02u:%02u\r\n",
+                rtc_date.year, rtc_date.month, rtc_date.day,
+                rtc_date.hour, rtc_date.minute, rtc_date.second);
+            WiFi_SNTP_LCD_ShowSNTP("OK", mkcolor(120, 255, 120));
+            WiFi_SNTP_LCD_ShowDate(&rtc_date);
+            WiFi_SNTP_LCD_ShowTime(&rtc_date);
+            return true;
         }
 
-        vTaskDelay(pdMS_TO_TICKS(AHT20_LCD_REFRESH_MS));
+        vTaskDelay(retry_ticks);
+    }
+
+    printf("[SNTP] sync failed\r\n");
+    WiFi_SNTP_LCD_ShowSNTP("ERROR", mkcolor(255, 80, 80));
+    return false;
+}
+
+static bool wait_wifi_connected(esp_wifi_info_t *wifi_info)
+{
+    const TickType_t retry_ticks = pdMS_TO_TICKS(1000);
+    const TickType_t timeout_ticks = pdMS_TO_TICKS(WIFI_CONNECT_TIMEOUT_MS);
+    TickType_t start_tick = xTaskGetTickCount();
+
+    while ((xTaskGetTickCount() - start_tick) < timeout_ticks)
+    {
+        esp_wifi_info_t info = { 0 };
+
+        if (esp_at_get_wifi_info(&info) && info.connected)
+        {
+            if (wifi_info != NULL)
+            {
+                *wifi_info = info;
+            }
+            return true;
+        }
+
+        vTaskDelay(retry_ticks);
+    }
+
+    return false;
+}
+
+static void WiFi_SNTP_LCD_Test(void)
+{
+    bool sensor_ready = false;
+    TickType_t last_sensor_tick = 0;
+    TickType_t last_link_check_tick = 0;
+
+    printf("[WIFI TEST] start\r\n");
+    WiFi_SNTP_LCD_DrawTemplate();
+
+    while (1)
+    {
+        esp_wifi_info_t wifi_info = { 0 };
+
+        WiFi_SNTP_LCD_ShowWiFi("ESP init...", mkcolor(255, 255, 0));
+        printf("[WIFI TEST] ESP init...\r\n");
+        if (!esp_at_init())
+        {
+            printf("[WIFI TEST] ESP init failed\r\n");
+            WiFi_SNTP_LCD_ShowWiFi("ESP INIT ERROR", mkcolor(255, 80, 80));
+            WiFi_SNTP_LCD_ShowSNTP("Check ESP/Power", 0xFFFF);
+            vTaskDelay(pdMS_TO_TICKS(WIFI_RETRY_DELAY_MS));
+            continue;
+        }
+
+        printf("[WIFI TEST] WiFi stack init...\r\n");
+        if (!esp_at_wifi_init())
+        {
+            printf("[WIFI TEST] WiFi stack init failed\r\n");
+            WiFi_SNTP_LCD_ShowWiFi("AT WIFI ERROR", mkcolor(255, 80, 80));
+            WiFi_SNTP_LCD_ShowSNTP("Check ESP AT FW", 0xFFFF);
+            vTaskDelay(pdMS_TO_TICKS(WIFI_RETRY_DELAY_MS));
+            continue;
+        }
+
+        printf("[WIFI TEST] SNTP init...\r\n");
+        if (!esp_at_sntp_init())
+        {
+            printf("[WIFI TEST] SNTP init failed\r\n");
+            WiFi_SNTP_LCD_ShowWiFi("OK", mkcolor(120, 255, 120));
+            WiFi_SNTP_LCD_ShowSNTP("INIT ERROR", mkcolor(255, 80, 80));
+            vTaskDelay(pdMS_TO_TICKS(WIFI_RETRY_DELAY_MS));
+            continue;
+        }
+
+        WiFi_SNTP_LCD_ShowWiFi("Connecting...", mkcolor(255, 255, 0));
+        printf("[WIFI TEST] WiFi connecting...\r\n");
+        if (!esp_at_connect_wifi(WIFI_SSID, WIFI_PASSWD, NULL))
+        {
+            printf("[WIFI TEST] AT command no response\r\n");
+            WiFi_SNTP_LCD_ShowWiFi("CONNECT CMD ERR", mkcolor(255, 80, 80));
+            WiFi_SNTP_LCD_ShowSNTP("Check ESP/WiFi", 0xFFFF);
+            vTaskDelay(pdMS_TO_TICKS(WIFI_RETRY_DELAY_MS));
+            continue;
+        }
+
+        if (!wait_wifi_connected(&wifi_info))
+        {
+            printf("[WIFI TEST] WiFi connect timeout\r\n");
+            WiFi_SNTP_LCD_ShowWiFi("ERROR", mkcolor(255, 80, 80));
+            WiFi_SNTP_LCD_ShowSNTP("Check ESP/WiFi", 0xFFFF);
+            vTaskDelay(pdMS_TO_TICKS(WIFI_RETRY_DELAY_MS));
+            continue;
+        }
+
+        printf("[WIFI TEST] WiFi connected\r\n");
+        printf("[WIFI TEST] SSID: %s, RSSI: %d\r\n", wifi_info.ssid, wifi_info.rssi);
+        WiFi_SNTP_LCD_ShowWiFi("OK", mkcolor(120, 255, 120));
+
+        if (!sntp_sync_rtc())
+        {
+            vTaskDelay(pdMS_TO_TICKS(WIFI_RETRY_DELAY_MS));
+            continue;
+        }
+
+        last_sensor_tick = 0;
+        last_link_check_tick = 0;
+
+        while (1)
+        {
+            TickType_t now_tick = xTaskGetTickCount();
+            rtc_date_time_t now = { 0 };
+
+            rtc_get_time(&now);
+            if (now.year >= 2000)
+            {
+                WiFi_SNTP_LCD_ShowTime(&now);
+                WiFi_SNTP_LCD_ShowDate(&now);
+            }
+
+            if (last_sensor_tick == 0 || (now_tick - last_sensor_tick) >= pdMS_TO_TICKS(WIFI_TEST_AHT20_REFRESH_MS))
+            {
+                int temperature_tenths = 0;
+                int humidity_tenths = 0;
+
+                if (aht20_read_tenths(&sensor_ready, &temperature_tenths, &humidity_tenths))
+                {
+                    printf("[AHT20] Temp: %d.%d C, Humi: %d.%d %%\r\n",
+                        temperature_tenths / 10, abs(temperature_tenths % 10),
+                        humidity_tenths / 10, abs(humidity_tenths % 10));
+                    WiFi_SNTP_LCD_ShowIndoorData(temperature_tenths, humidity_tenths);
+                }
+                else
+                {
+                    printf("[AHT20] read failed\r\n");
+                    WiFi_SNTP_LCD_ShowIndoorError();
+                }
+
+                last_sensor_tick = now_tick;
+            }
+
+            if (last_link_check_tick == 0 || (now_tick - last_link_check_tick) >= pdMS_TO_TICKS(WIFI_TEST_LINK_CHECK_MS))
+            {
+                esp_wifi_info_t link_info = { 0 };
+
+                if (!esp_at_get_wifi_info(&link_info) || !link_info.connected)
+                {
+                    printf("[WIFI TEST] WiFi lost\r\n");
+                    WiFi_SNTP_LCD_ShowWiFi("LOST, RETRY...", mkcolor(255, 80, 80));
+                    WiFi_SNTP_LCD_ShowSNTP("WAIT RECONNECT", mkcolor(255, 255, 0));
+                    break;
+                }
+
+                last_link_check_tick = now_tick;
+            }
+
+            vTaskDelay(pdMS_TO_TICKS(WIFI_TEST_LOOP_MS));
+        }
     }
 }
 
@@ -192,10 +482,11 @@ static void main_init(void *param)
     ST7789_DisplaySelfTest();
 #endif
 
-#if ENABLE_AHT20_LCD_TEST
+#if ENABLE_WIFI_SNTP_LCD_TEST
+    WiFi_SNTP_LCD_Test();
+#elif ENABLE_AHT20_LCD_TEST
     AHT20_LCD_Test();
-#endif
-
+#else
     welcome_page_display();
 
     wifi_init();
@@ -204,6 +495,7 @@ static void main_init(void *param)
 
     main_page_display();
     app_init();
+#endif
 
     while (1)
     {
