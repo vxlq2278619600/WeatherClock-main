@@ -6,7 +6,6 @@
 #include "tim_delay.h"
 #include "console.h"
 #include "rtc.h"
-#include "aht20.h"
 
 #define RTC_CLOCK_WAIT_TIMEOUT  1000000UL
 
@@ -30,6 +29,7 @@ void board_lowlevel_init(void)
     RCC_AHB1PeriphClockCmd(RCC_AHB1Periph_GPIOE, ENABLE);
     RCC_APB2PeriphClockCmd(RCC_APB2Periph_USART1, ENABLE);
     RCC_APB1PeriphClockCmd(RCC_APB1Periph_USART2, ENABLE);
+    RCC_APB1PeriphClockCmd(RCC_APB1Periph_I2C1, ENABLE);
     RCC_APB1PeriphClockCmd(RCC_APB1Periph_I2C2, ENABLE);
     RCC_APB1PeriphClockCmd(RCC_APB1Periph_SPI2, ENABLE);
     RCC_APB1PeriphClockCmd(RCC_APB1Periph_TIM6, ENABLE);
@@ -60,7 +60,6 @@ void board_init(void)
     printf("[SYS] Build Date: %s %s\n", __DATE__, __TIME__);
     
     rtc_init();
-    aht20_init();
 }
 
 int fputc(int ch, FILE *f)
