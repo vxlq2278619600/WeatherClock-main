@@ -416,6 +416,11 @@
               <FilePath>..\app\ui.c</FilePath>
             </File>
             <File>
+              <FileName>weather_clock_ui.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\app\weather_clock_ui.c</FilePath>
+            </File>
+            <File>
               <FileName>workqueue.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\app\workqueue.c</FilePath>

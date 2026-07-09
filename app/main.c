@@ -13,6 +13,7 @@
 #include "aht20.h"
 #include "esp_at.h"
 #include "rtc.h"
+#include "weather_clock_ui.h"
 
 #define ENABLE_LCD_SELF_TEST       0
 #define ENABLE_AHT20_LCD_TEST      0
@@ -31,6 +32,7 @@
 #define ESP_AT_TEST_SHORT_TIMEOUT_MS   2000
 #define ESP_AT_TEST_GMR_TIMEOUT_MS     3000
 #define ESP_AT_TIME_REFRESH_MS         1000
+#define ESP_AT_TIME_RESYNC_MS          (30 * 60 * 1000)
 
 extern void board_lowlevel_init(void);
 extern void board_init(void);
@@ -347,6 +349,39 @@ static void esp_test_log_response(void)
     printf("[ESP TEST] Response:\r\n%s\r\n", esp_at_last_response());
 }
 
+static void clock_time_from_rtc(const rtc_date_time_t *rtc_time, clock_time_t *clock_time)
+{
+    clock_time->year = rtc_time->year;
+    clock_time->month = rtc_time->month;
+    clock_time->day = rtc_time->day;
+    clock_time->hour = rtc_time->hour;
+    clock_time->minute = rtc_time->minute;
+    clock_time->second = rtc_time->second;
+}
+
+static void rtc_time_set_from_sntp(const esp_date_time_t *esp_time, rtc_date_time_t *rtc_time)
+{
+    rtc_time->year = esp_time->year;
+    rtc_time->month = esp_time->month;
+    rtc_time->day = esp_time->day;
+    rtc_time->hour = esp_time->hour;
+    rtc_time->minute = esp_time->minute;
+    rtc_time->second = esp_time->second;
+    rtc_time->weekday = esp_time->weekday;
+    rtc_set_time(rtc_time);
+}
+
+static void rtc_time_tick(clock_time_t *clock_time)
+{
+    rtc_date_time_t rtc_time = { 0 };
+
+    rtc_get_time(&rtc_time);
+    if (rtc_time.year >= 2000)
+    {
+        clock_time_from_rtc(&rtc_time, clock_time);
+    }
+}
+
 static bool esp_at_self_test(void)
 {
     printf("[ESP TEST] wait ESP boot...\r\n");
@@ -356,7 +391,7 @@ static bool esp_at_self_test(void)
         return false;
     }
 
-    ESP_AT_LCD_ShowProgress("Sending AT...", mkcolor(255, 255, 0));
+    weather_clock_update_status("ESP AT...");
     printf("[ESP TEST] Send: AT\r\n");
     if (!esp_at_command("AT", ESP_AT_TEST_SHORT_TIMEOUT_MS))
     {
@@ -367,8 +402,7 @@ static bool esp_at_self_test(void)
     esp_test_log_response();
     printf("[ESP TEST] ESP AT OK\r\n");
 
-    ESP_AT_LCD_ShowStatus("ESP AT", "OK", 160, mkcolor(120, 255, 120));
-    ESP_AT_LCD_ShowProgress("Reading GMR...", mkcolor(255, 255, 0));
+    weather_clock_update_status("ESP AT OK");
     printf("[ESP TEST] Send: AT+GMR\r\n");
     if (!esp_at_command("AT+GMR", ESP_AT_TEST_GMR_TIMEOUT_MS))
     {
@@ -379,7 +413,7 @@ static bool esp_at_self_test(void)
     esp_test_log_response();
     printf("[ESP TEST] GMR OK\r\n");
 
-    ESP_AT_LCD_ShowStatus("GMR", "OK", 186, mkcolor(120, 255, 120));
+    weather_clock_update_status("GMR OK");
     return true;
 }
 
@@ -388,7 +422,7 @@ static bool esp_at_wifi_connect(char *ip, uint32_t ip_size, const char **failed_
     if (failed_stage != NULL)
         *failed_stage = "WIFI FAIL";
 
-    ESP_AT_LCD_ShowProgress("Sending ATE0...", mkcolor(255, 255, 0));
+    weather_clock_update_status("ATE0...");
     printf("[ESP TEST] Send: ATE0\r\n");
     if (!esp_at_echo_off())
     {
@@ -400,7 +434,7 @@ static bool esp_at_wifi_connect(char *ip, uint32_t ip_size, const char **failed_
     }
     esp_test_log_response();
 
-    ESP_AT_LCD_ShowProgress("Setting mode...", mkcolor(255, 255, 0));
+    weather_clock_update_status("WiFi Mode...");
     printf("[ESP TEST] Send: AT+CWMODE=1\r\n");
     if (!esp_at_wifi_init())
     {
@@ -412,9 +446,9 @@ static bool esp_at_wifi_connect(char *ip, uint32_t ip_size, const char **failed_
     }
     esp_test_log_response();
     printf("[ESP TEST] WIFI MODE OK\r\n");
-    ESP_AT_LCD_ShowStatus("MODE", "OK", 212, mkcolor(120, 255, 120));
+    weather_clock_update_status("WiFi Mode OK");
 
-    ESP_AT_LCD_ShowProgress("Joining hotspot...", mkcolor(255, 255, 0));
+    weather_clock_update_status("WiFi Join...");
     printf("[ESP TEST] Send: AT+CWJAP=\"%s\",\"******\"\r\n", WIFI_SSID);
     if (!esp_at_connect_wifi(WIFI_SSID, WIFI_PASSWORD, NULL))
     {
@@ -426,9 +460,9 @@ static bool esp_at_wifi_connect(char *ip, uint32_t ip_size, const char **failed_
     }
     esp_test_log_response();
     printf("[ESP TEST] WIFI JOIN OK\r\n");
-    ESP_AT_LCD_ShowStatus("WIFI", "OK", 238, mkcolor(120, 255, 120));
+    weather_clock_show_wifi_status(true);
 
-    ESP_AT_LCD_ShowProgress("Getting IP...", mkcolor(255, 255, 0));
+    weather_clock_update_status("Getting IP...");
     printf("[ESP TEST] Send: AT+CIFSR\r\n");
     if (!esp_at_get_ip(ip, ip_size))
     {
@@ -451,19 +485,20 @@ static bool esp_at_sntp_sync_clock(rtc_date_time_t *date_time)
     const TickType_t timeout_ticks = pdMS_TO_TICKS(SNTP_SYNC_TIMEOUT_MS);
     TickType_t start_tick = xTaskGetTickCount();
 
-    ESP_AT_LCD_ShowProgress("Config SNTP...", mkcolor(255, 255, 0));
+    weather_clock_update_status("SNTP Sync...");
     printf("[ESP TEST] Send: AT+CIPSNTPCFG=1,8,\"ntp.aliyun.com\",\"cn.ntp.org.cn\",\"pool.ntp.org\"\r\n");
     if (!esp_at_sntp_config())
     {
         esp_test_log_response();
         printf("[ESP TEST] SNTP CFG FAIL\r\n");
-        ESP_AT_LCD_ShowProgress("SNTP CFG FAIL", mkcolor(255, 80, 80));
+        weather_clock_show_error("TIME FAIL");
         return false;
     }
     esp_test_log_response();
     printf("[ESP TEST] SNTP CFG OK\r\n");
+    printf("[ESP TEST] SNTP OK\r\n");
 
-    ESP_AT_LCD_ShowProgress("Getting time...", mkcolor(255, 255, 0));
+    weather_clock_update_status("Time Sync...");
     while ((xTaskGetTickCount() - start_tick) < timeout_ticks)
     {
         esp_date_time_t esp_date = { 0 };
@@ -473,18 +508,12 @@ static bool esp_at_sntp_sync_clock(rtc_date_time_t *date_time)
         {
             esp_test_log_response();
 
-            date_time->year = esp_date.year;
-            date_time->month = esp_date.month;
-            date_time->day = esp_date.day;
-            date_time->hour = esp_date.hour;
-            date_time->minute = esp_date.minute;
-            date_time->second = esp_date.second;
-            date_time->weekday = esp_date.weekday;
-            rtc_set_time(date_time);
+            rtc_time_set_from_sntp(&esp_date, date_time);
 
             printf("[ESP TEST] TIME OK: %04u-%02u-%02u %02u:%02u:%02u\r\n",
                 date_time->year, date_time->month, date_time->day,
                 date_time->hour, date_time->minute, date_time->second);
+            printf("[ESP TEST] TIME SYNC OK\r\n");
             return true;
         }
 
@@ -493,7 +522,7 @@ static bool esp_at_sntp_sync_clock(rtc_date_time_t *date_time)
     }
 
     printf("[ESP TEST] TIME FAIL\r\n");
-    ESP_AT_LCD_ShowProgress("TIME FAIL", mkcolor(255, 80, 80));
+    weather_clock_show_error("TIME FAIL");
     return false;
 }
 
@@ -503,9 +532,10 @@ static void ESP_AT_BasicTest(void)
     {
         char ip[32];
         rtc_date_time_t date_time = { 0 };
+        clock_time_t clock_time = { 0 };
         const char *failed_stage = "WIFI FAIL";
 
-        ESP_AT_LCD_ShowTemplate();
+        weather_clock_show_boot();
 
         printf("[ESP TEST] start\r\n");
         printf("[ESP TEST] UART2 init: 115200 8N1\r\n");
@@ -514,20 +544,22 @@ static void ESP_AT_BasicTest(void)
 
         if (!esp_at_self_test())
         {
-            ESP_AT_LCD_ShowProgress("AT OR GMR FAIL", mkcolor(255, 80, 80));
+            weather_clock_show_error("AT FAIL");
             vTaskDelay(pdMS_TO_TICKS(ESP_AT_TEST_RETRY_DELAY_MS));
             continue;
         }
 
         if (!esp_at_wifi_connect(ip, sizeof(ip), &failed_stage))
         {
-            ESP_AT_LCD_ShowProgress(failed_stage, mkcolor(255, 80, 80));
+            weather_clock_show_wifi_status(false);
+            weather_clock_show_error(failed_stage);
             vTaskDelay(pdMS_TO_TICKS(ESP_AT_TEST_RETRY_DELAY_MS));
             continue;
         }
-
-        ESP_AT_LCD_ShowStatus("IP", ip, 264, mkcolor(120, 255, 120));
-        ESP_AT_LCD_ShowProgress("WiFi Ready", mkcolor(120, 255, 120));
+        printf("[ESP TEST] WiFi OK\r\n");
+        printf("[ESP TEST] IP OK\r\n");
+        weather_clock_show_wifi_status(true);
+        weather_clock_update_status("IP OK");
 
         if (!esp_at_sntp_sync_clock(&date_time))
         {
@@ -535,16 +567,40 @@ static void ESP_AT_BasicTest(void)
             continue;
         }
 
-        ESP_AT_LCD_ShowClockTemplate(ip);
-        ESP_AT_LCD_ShowClockTime(&date_time);
+        clock_time_from_rtc(&date_time, &clock_time);
+        weather_clock_show_main(ip, &clock_time);
+        printf("[ESP TEST] MAIN UI START\r\n");
+
+        TickType_t last_sync_tick = xTaskGetTickCount();
 
         while (1)
         {
-            rtc_get_time(&date_time);
-            if (date_time.year >= 2000)
+            TickType_t now_tick = xTaskGetTickCount();
+
+            rtc_time_tick(&clock_time);
+            if (clock_time.year >= 2000)
             {
-                ESP_AT_LCD_ShowClockTime(&date_time);
+                weather_clock_update_time(&clock_time);
             }
+
+            if ((now_tick - last_sync_tick) >= pdMS_TO_TICKS(ESP_AT_TIME_RESYNC_MS))
+            {
+                printf("[ESP TEST] periodic time resync start\r\n");
+                if (esp_at_sntp_sync_clock(&date_time))
+                {
+                    clock_time_from_rtc(&date_time, &clock_time);
+                    weather_clock_update_time(&clock_time);
+                    weather_clock_update_status("Resync OK");
+                    printf("[ESP TEST] periodic time resync ok\r\n");
+                }
+                else
+                {
+                    weather_clock_update_status("Resync FAIL");
+                    printf("[ESP TEST] periodic time resync failed\r\n");
+                }
+                last_sync_tick = xTaskGetTickCount();
+            }
+
             vTaskDelay(pdMS_TO_TICKS(ESP_AT_TIME_REFRESH_MS));
         }
     }
