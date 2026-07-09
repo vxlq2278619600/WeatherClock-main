@@ -135,6 +135,8 @@ void weather_clock_show_weather(const weather_clock_weather_t *weather)
     char line[48];
     const bool ok = weather != NULL && weather->valid != 0;
     const bool has_city = weather != NULL && weather->city[0] != '\0';
+    const bool has_winddir = ok && weather->winddirection[0] != '\0' && strcmp(weather->winddirection, "--") != 0;
+    const bool has_windpower = ok && weather->windpower[0] != '\0' && strcmp(weather->windpower, "--") != 0;
 
     ui_fill_color(0, 0, UI_SCREEN_W - 1, UI_SCREEN_H - 1, WC_BG_COLOR);
     ui_write_string(UI_MARGIN_X, UI_MARGIN_TOP, "Weather", WC_FG_COLOR, WC_BG_COLOR, &font24_maple_bold);
@@ -147,7 +149,16 @@ void weather_clock_show_weather(const weather_clock_weather_t *weather)
     weather_clock_write_row(128, UI_LINE_H, line, WC_FG_COLOR, &font20_maple_bold);
     snprintf(line, sizeof(line), "Humi: %s %%", ok ? weather->humidity : "--");
     weather_clock_write_row(160, UI_LINE_H, line, WC_FG_COLOR, &font20_maple_bold);
-    snprintf(line, sizeof(line), "Wind: %s %s", ok ? weather->winddirection : "--", ok ? weather->windpower : "--");
+    if (has_winddir || has_windpower)
+    {
+        snprintf(line, sizeof(line), "Wind: %s %s",
+                 has_winddir ? weather->winddirection : "--",
+                 has_windpower ? weather->windpower : "--");
+    }
+    else
+    {
+        snprintf(line, sizeof(line), "Wind: --");
+    }
     weather_clock_write_row(192, UI_LINE_H, line, WC_FG_COLOR, &font20_maple_bold);
 
     if (ok && weather->reporttime[0] != '\0')

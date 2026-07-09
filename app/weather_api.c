@@ -147,6 +147,125 @@ static bool weather_is_ascii_text(const char *text)
     return true;
 }
 
+static bool weather_string_empty(const char *text)
+{
+    return text == NULL || text[0] == '\0';
+}
+
+static void weather_copy_or_default(char *out, uint32_t out_size, const char *text)
+{
+    if (out == NULL || out_size == 0)
+        return;
+
+    if (weather_string_empty(text))
+        snprintf(out, out_size, "--");
+    else
+        snprintf(out, out_size, "%s", text);
+}
+
+static void weather_map_winddirection(const char *raw, char *out, uint32_t out_size)
+{
+    if (out == NULL || out_size == 0)
+        return;
+
+    if (weather_string_empty(raw))
+    {
+        snprintf(out, out_size, "--");
+        return;
+    }
+
+    if (strstr(raw, "\xE6\x97\xA0\xE9\xA3\x8E\xE5\x90\x91") != NULL ||
+        strstr(raw, "\\u65e0\\u98ce\\u5411") != NULL)
+        snprintf(out, out_size, "Calm");
+    else if (strstr(raw, "\xE6\x97\x8B\xE8\xBD\xAC\xE4\xB8\x8D\xE5\xAE\x9A") != NULL ||
+             strstr(raw, "\\u65cb\\u8f6c\\u4e0d\\u5b9a") != NULL)
+        snprintf(out, out_size, "VRB");
+    else if (strstr(raw, "\xE4\xB8\x9C\xE5\x8C\x97") != NULL ||
+             (strstr(raw, "\\u4e1c") != NULL && strstr(raw, "\\u5317") != NULL))
+        snprintf(out, out_size, "NE");
+    else if (strstr(raw, "\xE4\xB8\x9C\xE5\x8D\x97") != NULL ||
+             (strstr(raw, "\\u4e1c") != NULL && strstr(raw, "\\u5357") != NULL))
+        snprintf(out, out_size, "SE");
+    else if (strstr(raw, "\xE8\xA5\xBF\xE5\x8D\x97") != NULL ||
+             (strstr(raw, "\\u897f") != NULL && strstr(raw, "\\u5357") != NULL))
+        snprintf(out, out_size, "SW");
+    else if (strstr(raw, "\xE8\xA5\xBF\xE5\x8C\x97") != NULL ||
+             (strstr(raw, "\\u897f") != NULL && strstr(raw, "\\u5317") != NULL))
+        snprintf(out, out_size, "NW");
+    else if (strstr(raw, "\xE5\x8C\x97") != NULL || strstr(raw, "\\u5317") != NULL)
+        snprintf(out, out_size, "N");
+    else if (strstr(raw, "\xE4\xB8\x9C") != NULL || strstr(raw, "\\u4e1c") != NULL)
+        snprintf(out, out_size, "E");
+    else if (strstr(raw, "\xE5\x8D\x97") != NULL || strstr(raw, "\\u5357") != NULL)
+        snprintf(out, out_size, "S");
+    else if (strstr(raw, "\xE8\xA5\xBF") != NULL || strstr(raw, "\\u897f") != NULL)
+        snprintf(out, out_size, "W");
+    else if (weather_is_ascii_text(raw))
+        weather_copy_or_default(out, out_size, raw);
+    else
+        snprintf(out, out_size, "--");
+}
+
+static void weather_simplify_windpower(const char *raw, char *out, uint32_t out_size)
+{
+    uint32_t i = 0;
+    uint32_t j = 0;
+
+    if (out == NULL || out_size == 0)
+        return;
+
+    if (weather_string_empty(raw))
+    {
+        snprintf(out, out_size, "--");
+        return;
+    }
+
+    while (raw[i] != '\0' && j + 1 < out_size)
+    {
+        unsigned char c = (unsigned char)raw[i];
+
+        if (c == 0xE2 && (unsigned char)raw[i + 1] == 0x89 && (unsigned char)raw[i + 2] == 0xA4)
+        {
+            if (j + 2 < out_size)
+            {
+                out[j++] = '<';
+                out[j++] = '=';
+            }
+            i += 3;
+        }
+        else if (strncmp(&raw[i], "\\u2264", 6) == 0)
+        {
+            if (j + 2 < out_size)
+            {
+                out[j++] = '<';
+                out[j++] = '=';
+            }
+            i += 6;
+        }
+        else if (c == 0xE7 && (unsigned char)raw[i + 1] == 0xBA && (unsigned char)raw[i + 2] == 0xA7)
+        {
+            i += 3;
+        }
+        else if (strncmp(&raw[i], "\\u7ea7", 6) == 0)
+        {
+            i += 6;
+        }
+        else if (c >= 0x20 && c <= 0x7E)
+        {
+            out[j++] = (char)c;
+            i++;
+        }
+        else
+        {
+            i++;
+        }
+    }
+
+    out[j] = '\0';
+    if (out[0] == '\0')
+        snprintf(out, out_size, "--");
+}
+
 int weather_api_init(void)
 {
     return 1;
@@ -157,6 +276,8 @@ int weather_parse_amap_json(const char *json, weather_api_info_t *out)
     char status[8] = { 0 };
     char info[32] = { 0 };
     char infocode[12] = { 0 };
+    char raw_winddirection[32] = { 0 };
+    char raw_windpower[32] = { 0 };
 
     if (json == NULL || out == NULL)
         return -1;
@@ -192,16 +313,18 @@ int weather_parse_amap_json(const char *json, weather_api_info_t *out)
         return -4;
     }
 
-    json_get_string(json, "\"winddirection\"", out->winddirection, sizeof(out->winddirection));
-    json_get_string(json, "\"windpower\"", out->windpower, sizeof(out->windpower));
+    json_get_string(json, "\"winddirection\"", raw_winddirection, sizeof(raw_winddirection));
+    json_get_string(json, "\"windpower\"", raw_windpower, sizeof(raw_windpower));
     json_get_string(json, "\"reporttime\"", out->reporttime, sizeof(out->reporttime));
 
     if (!weather_is_ascii_text(out->city))
         snprintf(out->city, sizeof(out->city), "%s", WEATHER_CITY_NAME);
     if (!weather_is_ascii_text(out->weather))
         snprintf(out->weather, sizeof(out->weather), "OK");
-    if (!weather_is_ascii_text(out->winddirection))
-        snprintf(out->winddirection, sizeof(out->winddirection), "--");
+    weather_map_winddirection(raw_winddirection, out->winddirection, sizeof(out->winddirection));
+    weather_simplify_windpower(raw_windpower, out->windpower, sizeof(out->windpower));
+    if (strcmp(out->winddirection, "--") == 0 && strcmp(out->windpower, "--") == 0)
+        printf("[WEATHER] wind field empty\r\n");
 
     out->valid = 1;
     return 1;
@@ -277,8 +400,14 @@ int weather_api_fetch(weather_api_info_t *out)
         return -5;
     }
 
-    printf("[WEATHER] parse OK: city=%s weather=%s temp=%s humi=%s\r\n",
-           out->city, out->weather, out->temperature, out->humidity);
+    printf("[WEATHER] parse OK:\r\n");
+    printf("city=%s\r\n", out->city);
+    printf("weather=%s\r\n", out->weather);
+    printf("temp=%s\r\n", out->temperature);
+    printf("humi=%s\r\n", out->humidity);
+    printf("winddir=%s\r\n", out->winddirection);
+    printf("windpower=%s\r\n", out->windpower);
+    printf("reporttime=%s\r\n", out->reporttime);
     printf("[WEATHER] fetch OK\r\n");
     printf("[WEATHER] next update in 30 min\r\n");
     return 1;
