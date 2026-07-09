@@ -23,7 +23,7 @@ typedef enum
 } at_ack_t;
 
 static char *rxline;
-static char rxbuf[1024];
+static char rxbuf[4096];
 static char txbuf[1024];
 static uint32_t rxlen;
 static at_ack_t rxack;
@@ -33,6 +33,15 @@ static at_ack_t esp_at_execute_command(const char *command, uint32_t timeout);
 static bool esp_at_write_command(const char *command, uint32_t timeout);
 static bool esp_at_wait_boot(uint32_t timeout);
 static void esp_at_usart_write(const char *data);
+static void esp_at_usart_write_len(const char *data, uint32_t len);
+static void esp_at_rx_reset(void);
+static void esp_at_ack_drain(void);
+static bool esp_at_wait_pattern(const char *pattern, uint32_t timeout);
+static void esp_at_copy_response(char *response, uint32_t response_size);
+static bool esp_at_send_raw_wait(const char *command, const char *pattern, uint32_t timeout);
+static bool esp_at_wait_http_response(char *response, uint32_t response_size, uint32_t timeout);
+static void esp_at_print_preview(const char *title, const char *data, uint32_t max_len);
+static bool esp_at_parse_ipv4(const char *response, char *ip, uint32_t ip_size);
 static at_ack_t match_internal_ack(const char *str);
 static at_ack_t esp_at_usart_wait_receive(uint32_t timeout);
 
@@ -145,6 +154,8 @@ static at_ack_t esp_at_execute_command(const char *command, uint32_t timeout)
     printf("[DEBUG] Send: %s", txbuf);
 #endif
 
+    esp_at_ack_drain();
+    esp_at_rx_reset();
     esp_at_usart_write(txbuf);
     rxack = AT_ACK_NONE;
     at_ack_t ack = esp_at_usart_wait_receive(timeout);
@@ -166,15 +177,48 @@ const char *esp_at_last_response(void)
     return rxbuf;
 }
 
+static void esp_at_rx_reset(void)
+{
+    taskENTER_CRITICAL();
+    rxlen = 0;
+    rxbuf[0] = '\0';
+    rxline = rxbuf;
+    rxack = AT_ACK_NONE;
+    taskEXIT_CRITICAL();
+}
+
+static void esp_at_ack_drain(void)
+{
+    if (at_ack_sempahore == NULL)
+        return;
+
+    while (xSemaphoreTake(at_ack_sempahore, 0) == pdPASS)
+    {
+        ;
+    }
+}
+
 static void esp_at_usart_write(const char *data)
 {
-    uint32_t len = strlen(data);
+    esp_at_usart_write_len(data, strlen(data));
+}
 
+static void esp_at_usart_write_len(const char *data, uint32_t len)
+{
     DMA1_Stream6->M0AR = (uint32_t)data;
     DMA1_Stream6->NDTR = len;
 
     DMA_ClearFlag(DMA1_Stream6, DMA_FLAG_TCIF6);
     DMA_Cmd(DMA1_Stream6, ENABLE);
+}
+
+bool esp_at_send_raw(const char *data, uint32_t len)
+{
+    if (data == NULL || len == 0)
+        return false;
+
+    esp_at_usart_write_len(data, len);
+    return true;
 }
 
 static at_ack_t match_internal_ack(const char *str)
@@ -193,11 +237,169 @@ static at_ack_t match_internal_ack(const char *str)
 
 static at_ack_t esp_at_usart_wait_receive(uint32_t timeout)
 {
-    rxlen = 0;
-    rxline = rxbuf;
-
     bool acked = xSemaphoreTake(at_ack_sempahore, pdMS_TO_TICKS(timeout)) == pdPASS;
     return acked ? rxack : AT_ACK_NONE;
+}
+
+static bool esp_at_wait_pattern(const char *pattern, uint32_t timeout)
+{
+    TickType_t start_tick = xTaskGetTickCount();
+    TickType_t timeout_ticks = pdMS_TO_TICKS(timeout);
+
+    while ((xTaskGetTickCount() - start_tick) < timeout_ticks)
+    {
+        if (strstr(rxbuf, pattern) != NULL)
+            return true;
+
+        if (strstr(rxbuf, "ERROR\r\n") != NULL || strstr(rxbuf, "busy p") != NULL)
+            return false;
+
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+
+    return false;
+}
+
+static void esp_at_copy_response(char *response, uint32_t response_size)
+{
+    uint32_t len;
+
+    if (response == NULL || response_size == 0)
+        return;
+
+    taskENTER_CRITICAL();
+    len = rxlen;
+    if (len >= response_size)
+        len = response_size - 1;
+    memcpy(response, rxbuf, len);
+    response[len] = '\0';
+    taskEXIT_CRITICAL();
+}
+
+static bool esp_at_send_raw_wait(const char *command, const char *pattern, uint32_t timeout)
+{
+    bool ok;
+
+    if (command == NULL || pattern == NULL)
+        return false;
+
+#if ESP_AT_DEBUG
+    printf("[DEBUG] Send: %s", command);
+#endif
+
+    esp_at_ack_drain();
+    esp_at_rx_reset();
+    esp_at_usart_write(command);
+    ok = esp_at_wait_pattern(pattern, timeout);
+
+#if ESP_AT_DEBUG
+    printf("[DEBUG] Response:\r\n%s\r\n", rxbuf);
+#endif
+
+    return ok;
+}
+
+static void esp_at_print_preview(const char *title, const char *data, uint32_t max_len)
+{
+    uint32_t i;
+
+    if (title != NULL)
+        printf("%s\r\n", title);
+
+    if (data == NULL)
+        return;
+
+    for (i = 0; data[i] != '\0' && i < max_len; i++)
+    {
+        char c = data[i];
+        if (c == '\r')
+            printf("\\r");
+        else if (c == '\n')
+            printf("\\n\r\n");
+        else
+            printf("%c", c);
+    }
+    printf("\r\n");
+}
+
+static bool esp_at_wait_http_response(char *response, uint32_t response_size, uint32_t timeout)
+{
+    TickType_t start_tick = xTaskGetTickCount();
+    TickType_t timeout_ticks = pdMS_TO_TICKS(timeout);
+    TickType_t last_rx_tick = start_tick;
+    uint32_t last_len = 0;
+    bool has_http_data = false;
+
+    printf("[WEATHER] wait HTTP response...\r\n");
+
+    while ((xTaskGetTickCount() - start_tick) < timeout_ticks)
+    {
+        uint32_t current_len;
+
+        taskENTER_CRITICAL();
+        current_len = rxlen;
+        taskEXIT_CRITICAL();
+
+        if (current_len != last_len)
+        {
+            printf("[WEATHER] recv chunk len=%u\r\n", (unsigned int)(current_len - last_len));
+            last_len = current_len;
+            last_rx_tick = xTaskGetTickCount();
+        }
+
+        if (strstr(rxbuf, "+IPD") != NULL ||
+            strstr(rxbuf, "HTTP/1.1") != NULL ||
+            strchr(rxbuf, '{') != NULL)
+        {
+            has_http_data = true;
+        }
+
+        if (strstr(rxbuf, "CLOSED") != NULL)
+        {
+            esp_at_copy_response(response, response_size);
+            printf("[WEATHER] HTTP response received, len=%u\r\n", (unsigned int)strlen(response));
+            esp_at_print_preview("[WEATHER] HTTP response preview:", response, 300);
+            return has_http_data;
+        }
+
+        if (has_http_data && (xTaskGetTickCount() - last_rx_tick) >= pdMS_TO_TICKS(1000))
+        {
+            esp_at_copy_response(response, response_size);
+            printf("[WEATHER] HTTP response received, len=%u\r\n", (unsigned int)strlen(response));
+            esp_at_print_preview("[WEATHER] HTTP response preview:", response, 300);
+            return true;
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(20));
+    }
+
+    esp_at_copy_response(response, response_size);
+    printf("[WEATHER] HTTP response timeout\r\n");
+    printf("[WEATHER] partial response len=%u\r\n", (unsigned int)strlen(response));
+    esp_at_print_preview("[WEATHER] partial response preview:", response, 300);
+    return false;
+}
+
+static bool esp_at_parse_ipv4(const char *response, char *ip, uint32_t ip_size)
+{
+    const char *p;
+    unsigned int a, b, c, d;
+
+    if (response == NULL || ip == NULL || ip_size == 0)
+        return false;
+
+    for (p = response; *p != '\0'; p++)
+    {
+        if ((*p >= '0' && *p <= '9') &&
+            sscanf(p, "%u.%u.%u.%u", &a, &b, &c, &d) == 4 &&
+            a <= 255 && b <= 255 && c <= 255 && d <= 255)
+        {
+            snprintf(ip, ip_size, "%u.%u.%u.%u", a, b, c, d);
+            return true;
+        }
+    }
+
+    return false;
 }
 
 static bool esp_at_wait_boot(uint32_t timeout)
@@ -428,6 +630,118 @@ const char *esp_at_http_get(const char *url)
     return esp_at_last_response();
 }
 
+bool esp_at_http_get_transport(const char *transport, const char *host, uint16_t port,
+                               const char *request, char *response,
+                               uint32_t response_size, uint32_t timeout_ms)
+{
+    int request_len;
+    char dns_ip[16] = { 0 };
+    bool pre_close_ok;
+    bool dns_ok;
+
+    if (transport == NULL || host == NULL || request == NULL || response == NULL || response_size == 0)
+        return false;
+
+    response[0] = '\0';
+
+    pre_close_ok = esp_at_command("AT+CIPCLOSE", 2000);
+    printf("[WEATHER] pre-close %s\r\n", pre_close_ok ? "OK" : "ignored");
+
+    if (esp_at_command("AT+CIPMUX=0", 3000))
+        printf("[WEATHER] CIPMUX=0 OK\r\n");
+    else
+        printf("[WEATHER] CIPMUX=0 FAIL\r\n");
+
+    if (esp_at_command("AT+CIPMODE=0", 3000))
+        printf("[WEATHER] CIPMODE=0 OK\r\n");
+    else
+        printf("[WEATHER] CIPMODE=0 FAIL\r\n");
+
+    if (esp_at_command("AT+CIPRECVMODE=0", 3000))
+        printf("[WEATHER] CIPRECVMODE=0 OK\r\n");
+    else
+        printf("[WEATHER] CIPRECVMODE=0 FAIL\r\n");
+
+    snprintf(txbuf, sizeof(txbuf), "AT+CIPDOMAIN=\"%s\"", host);
+    dns_ok = esp_at_command(txbuf, 5000);
+    if (dns_ok && esp_at_parse_ipv4(esp_at_last_response(), dns_ip, sizeof(dns_ip)))
+        printf("[WEATHER] DNS OK: %s\r\n", dns_ip);
+    else
+        printf("[WEATHER] DNS FAIL\r\n");
+
+    if (strcmp(transport, "SSL") == 0)
+    {
+        snprintf(txbuf, sizeof(txbuf), "AT+CIPSSLCSNI=1,\"%s\"", host);
+        if (esp_at_command(txbuf, 3000))
+            printf("[WEATHER] SSL SNI OK\r\n");
+        else
+            printf("[WEATHER] SSL SNI FAIL\r\n");
+    }
+
+    printf("[WEATHER] TCP connect start\r\n");
+    snprintf(txbuf, sizeof(txbuf), "AT+CIPSTART=\"%s\",\"%s\",%u\r\n", transport, host, port);
+    if (!esp_at_send_raw_wait(txbuf, "CONNECT", 10000) &&
+        strstr(esp_at_last_response(), "ALREADY CONNECTED") == NULL)
+    {
+        esp_at_copy_response(response, response_size);
+        printf("[WEATHER] TCP connect FAIL\r\n");
+        printf("[WEATHER] CIPSTART response: %s\r\n", esp_at_last_response());
+        return false;
+    }
+    printf("[WEATHER] TCP connect OK\r\n");
+
+    request_len = strlen(request);
+    snprintf(txbuf, sizeof(txbuf), "AT+CIPSEND=%d\r\n", request_len);
+    if (!esp_at_send_raw_wait(txbuf, ">", 3000))
+    {
+        esp_at_copy_response(response, response_size);
+        printf("[WEATHER] CIPSEND prompt FAIL\r\n");
+        esp_at_command("AT+CIPCLOSE", 2000);
+        return false;
+    }
+    printf("[WEATHER] CIPSEND OK\r\n");
+
+    esp_at_ack_drain();
+    esp_at_rx_reset();
+    printf("[DEBUG] Send: HTTP request, len=%d\r\n", request_len);
+    esp_at_send_raw(request, (uint32_t)request_len);
+
+    if (!esp_at_wait_pattern("SEND OK", 5000))
+    {
+        esp_at_copy_response(response, response_size);
+        printf("[WEATHER] raw send FAIL\r\n");
+        printf("[WEATHER] raw send response: %s\r\n", response);
+        if (esp_at_command("AT+CIPCLOSE", 2000))
+            printf("[WEATHER] close OK\r\n");
+        else
+            printf("[WEATHER] close ignored\r\n");
+        return false;
+    }
+    printf("[WEATHER] raw send OK\r\n");
+
+    if (!esp_at_wait_http_response(response, response_size, timeout_ms))
+    {
+        if (esp_at_command("AT+CIPCLOSE", 2000))
+            printf("[WEATHER] close OK\r\n");
+        else
+            printf("[WEATHER] close ignored\r\n");
+        return false;
+    }
+
+    if (esp_at_command("AT+CIPCLOSE", 2000))
+        printf("[WEATHER] close OK\r\n");
+    else
+        printf("[WEATHER] close ignored\r\n");
+    return true;
+}
+
+bool esp_at_tcp_http_get(const char *host, uint16_t port, const char *request,
+                         char *response, uint32_t response_size, uint32_t timeout_ms)
+{
+    return esp_at_http_get_transport("TCP", host, port, request,
+                                     response, response_size, timeout_ms);
+}
+
 void USART2_IRQHandler(void)
 {
     if (USART_GetITStatus(USART2, USART_IT_RXNE) == SET)
@@ -435,6 +749,7 @@ void USART2_IRQHandler(void)
         if (rxlen < sizeof(rxbuf) - 1)
         {
             rxbuf[rxlen++] = (char)USART_ReceiveData(USART2);
+            rxbuf[rxlen] = '\0';
             if (rxbuf[rxlen - 1] == '\n')
             {
                 rxbuf[rxlen] = '\0';

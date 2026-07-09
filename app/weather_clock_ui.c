@@ -1,5 +1,6 @@
 #include <stdio.h>
 #include <stdint.h>
+#include <string.h>
 #include "ui.h"
 #include "weather_clock_ui.h"
 
@@ -44,13 +45,13 @@ static void weather_clock_format_sensor_line(char *buf, size_t buf_size, const w
 
     if (sensor == NULL || sensor->valid == 0)
     {
-        snprintf(buf, buf_size, "T:--.-C H:--.-%%");
+        snprintf(buf, buf_size, "Local:--.-C --.-%%");
         return;
     }
 
     weather_clock_format_tenths(temperature, sizeof(temperature), sensor->temperature_tenths);
     weather_clock_format_tenths(humidity, sizeof(humidity), sensor->humidity_tenths);
-    snprintf(buf, buf_size, "T:%sC H:%s%%", temperature, humidity);
+    snprintf(buf, buf_size, "Local:%sC %s%%", temperature, humidity);
 }
 
 void weather_clock_show_boot(void)
@@ -75,38 +76,90 @@ void weather_clock_show_error(const char *message)
     weather_clock_write_row(176, 42, message, WC_ERROR_COLOR, &font32_maple_bold);
 }
 
-void weather_clock_show_main(const clock_time_t *time, const weather_clock_sensor_t *sensor)
+static void weather_clock_format_weather_line(char *buf, size_t buf_size, const weather_clock_weather_t *weather)
+{
+    if (weather == NULL || weather->valid == 0)
+    {
+        snprintf(buf, buf_size, "Weather: %s", (weather != NULL && weather->last_fail != 0) ? "FAIL" : "--");
+        return;
+    }
+
+    if (weather->last_fail != 0)
+    {
+        snprintf(buf, buf_size, "Weather: FAIL");
+        return;
+    }
+
+    snprintf(buf, buf_size, "Weather: %s", weather->weather[0] != '\0' ? weather->weather : "--");
+}
+
+void weather_clock_show_main(const clock_time_t *time, const weather_clock_sensor_t *sensor,
+                             const weather_clock_weather_t *weather)
 {
     ui_fill_color(0, 0, UI_SCREEN_W - 1, UI_SCREEN_H - 1, WC_BG_COLOR);
     ui_write_string(UI_MARGIN_X, UI_MARGIN_TOP, "Weather Clock", WC_FG_COLOR, WC_BG_COLOR, &font24_maple_bold);
     weather_clock_write_row(58, UI_LINE_H, "WiFi: OK", WC_OK_COLOR, &font20_maple_bold);
     weather_clock_update_time(WEATHER_CLOCK_PAGE_MAIN, time);
+    weather_clock_update_weather(WEATHER_CLOCK_PAGE_MAIN, weather);
     weather_clock_update_sensor(WEATHER_CLOCK_PAGE_MAIN, sensor);
 }
 
-void weather_clock_show_network(const char *ip, bool wifi_ok, bool sntp_ok, const clock_time_t *last_sync)
+void weather_clock_show_network(const char *ip, bool wifi_ok, bool sntp_ok,
+                                const weather_clock_weather_t *weather)
 {
     char line[48];
 
     ui_fill_color(0, 0, UI_SCREEN_W - 1, UI_SCREEN_H - 1, WC_BG_COLOR);
-    ui_write_string(UI_MARGIN_X, UI_MARGIN_TOP, "WiFi Status", WC_FG_COLOR, WC_BG_COLOR, &font24_maple_bold);
+    ui_write_string(UI_MARGIN_X, UI_MARGIN_TOP, "Network", WC_FG_COLOR, WC_BG_COLOR, &font24_maple_bold);
     weather_clock_write_row(64, UI_LINE_H, wifi_ok ? "WiFi: OK" : "WiFi: FAIL",
                             wifi_ok ? WC_OK_COLOR : WC_ERROR_COLOR, &font20_maple_bold);
     snprintf(line, sizeof(line), "IP: %s", ip != NULL ? ip : "--");
     weather_clock_write_row(96, UI_LINE_H, line, WC_FG_COLOR, &font20_maple_bold);
     weather_clock_write_row(128, UI_LINE_H, sntp_ok ? "SNTP: OK" : "SNTP: FAIL",
                             sntp_ok ? WC_OK_COLOR : WC_ERROR_COLOR, &font20_maple_bold);
-    if (last_sync != NULL && last_sync->year >= 2000)
+    snprintf(line, sizeof(line), "City: %s",
+             (weather != NULL && weather->city[0] != '\0') ? weather->city : "--");
+    weather_clock_write_row(164, UI_LINE_H, line, WC_FG_COLOR, &font20_maple_bold);
+    snprintf(line, sizeof(line), "Weather: %s",
+             (weather != NULL && weather->last_fail != 0) ? "FAIL" :
+             ((weather != NULL && weather->valid != 0 && weather->weather[0] != '\0') ? weather->weather : "--"));
+    weather_clock_write_row(196, UI_LINE_H, line, WC_WARN_COLOR, &font20_maple_bold);
+    snprintf(line, sizeof(line), "Out: %sC %s%%",
+             (weather != NULL && weather->valid != 0) ? weather->temperature : "--",
+             (weather != NULL && weather->valid != 0) ? weather->humidity : "--");
+    weather_clock_write_row(228, UI_LINE_H, line, WC_FG_COLOR, &font20_maple_bold);
+}
+
+void weather_clock_show_weather(const weather_clock_weather_t *weather)
+{
+    char line[48];
+    const bool ok = weather != NULL && weather->valid != 0;
+    const bool has_city = weather != NULL && weather->city[0] != '\0';
+
+    ui_fill_color(0, 0, UI_SCREEN_W - 1, UI_SCREEN_H - 1, WC_BG_COLOR);
+    ui_write_string(UI_MARGIN_X, UI_MARGIN_TOP, "Weather", WC_FG_COLOR, WC_BG_COLOR, &font24_maple_bold);
+
+    snprintf(line, sizeof(line), "City: %s", has_city ? weather->city : "--");
+    weather_clock_write_row(64, UI_LINE_H, line, WC_FG_COLOR, &font20_maple_bold);
+    snprintf(line, sizeof(line), "W: %s", (weather != NULL && weather->last_fail != 0) ? "FAIL" : (ok ? weather->weather : "--"));
+    weather_clock_write_row(96, UI_LINE_H, line, ok ? WC_OK_COLOR : WC_ERROR_COLOR, &font20_maple_bold);
+    snprintf(line, sizeof(line), "Temp: %s C", ok ? weather->temperature : "--");
+    weather_clock_write_row(128, UI_LINE_H, line, WC_FG_COLOR, &font20_maple_bold);
+    snprintf(line, sizeof(line), "Humi: %s %%", ok ? weather->humidity : "--");
+    weather_clock_write_row(160, UI_LINE_H, line, WC_FG_COLOR, &font20_maple_bold);
+    snprintf(line, sizeof(line), "Wind: %s %s", ok ? weather->winddirection : "--", ok ? weather->windpower : "--");
+    weather_clock_write_row(192, UI_LINE_H, line, WC_FG_COLOR, &font20_maple_bold);
+
+    if (ok && weather->reporttime[0] != '\0')
     {
-        char time_text[16];
-        weather_clock_format_time(time_text, sizeof(time_text), last_sync);
-        snprintf(line, sizeof(line), "Last Sync: %s", time_text);
+        const char *time = strchr(weather->reporttime, ' ');
+        snprintf(line, sizeof(line), "Update:%s", time != NULL ? time + 1 : weather->reporttime);
     }
     else
     {
-        snprintf(line, sizeof(line), "Last Sync: --:--:--");
+        snprintf(line, sizeof(line), "Update: --");
     }
-    weather_clock_write_row(164, UI_LINE_H, line, WC_WARN_COLOR, &font20_maple_bold);
+    weather_clock_write_row(224, UI_LINE_H, line, WC_WARN_COLOR, &font20_maple_bold);
 }
 
 void weather_clock_show_sensor(const weather_clock_sensor_t *sensor)
@@ -146,21 +199,26 @@ void weather_clock_show_sensor(const weather_clock_sensor_t *sensor)
 
 void weather_clock_show_page(weather_clock_page_t page, const char *ip, const clock_time_t *time,
                              const clock_time_t *last_sync, const weather_clock_sensor_t *sensor,
-                             bool wifi_ok, bool sntp_ok)
+                             const weather_clock_weather_t *weather, bool wifi_ok, bool sntp_ok)
 {
+    (void)last_sync;
+
     switch (page)
     {
     case WEATHER_CLOCK_PAGE_MAIN:
-        weather_clock_show_main(time, sensor);
+        weather_clock_show_main(time, sensor, weather);
         break;
     case WEATHER_CLOCK_PAGE_NETWORK:
-        weather_clock_show_network(ip, wifi_ok, sntp_ok, last_sync);
+        weather_clock_show_network(ip, wifi_ok, sntp_ok, weather);
         break;
     case WEATHER_CLOCK_PAGE_SENSOR:
         weather_clock_show_sensor(sensor);
         break;
+    case WEATHER_CLOCK_PAGE_WEATHER:
+        weather_clock_show_weather(weather);
+        break;
     default:
-        weather_clock_show_main(time, sensor);
+        weather_clock_show_main(time, sensor, weather);
         break;
     }
 }
@@ -193,6 +251,25 @@ void weather_clock_update_sensor(weather_clock_page_t page, const weather_clock_
     if (page == WEATHER_CLOCK_PAGE_SENSOR)
     {
         weather_clock_show_sensor(sensor);
+    }
+}
+
+void weather_clock_update_weather(weather_clock_page_t page, const weather_clock_weather_t *weather)
+{
+    char line[32];
+
+    if (page == WEATHER_CLOCK_PAGE_MAIN)
+    {
+        weather_clock_format_weather_line(line, sizeof(line), weather);
+        weather_clock_write_row(218, UI_LINE_H, line,
+                                (weather != NULL && weather->last_fail != 0) ? WC_ERROR_COLOR : WC_WARN_COLOR,
+                                &font16_maple);
+        return;
+    }
+
+    if (page == WEATHER_CLOCK_PAGE_NETWORK || page == WEATHER_CLOCK_PAGE_WEATHER)
+    {
+        weather_clock_show_page(page, NULL, NULL, NULL, NULL, weather, true, true);
     }
 }
 

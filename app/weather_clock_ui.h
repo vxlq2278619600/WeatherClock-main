@@ -21,11 +21,25 @@ typedef struct
     uint8_t valid;
 } weather_clock_sensor_t;
 
+typedef struct
+{
+    char city[24];
+    char weather[24];
+    char temperature[12];
+    char humidity[12];
+    char winddirection[16];
+    char windpower[16];
+    char reporttime[24];
+    uint8_t valid;
+    uint8_t last_fail;
+} weather_clock_weather_t;
+
 typedef enum
 {
     WEATHER_CLOCK_PAGE_MAIN = 0,
     WEATHER_CLOCK_PAGE_NETWORK,
     WEATHER_CLOCK_PAGE_SENSOR,
+    WEATHER_CLOCK_PAGE_WEATHER,
     WEATHER_CLOCK_PAGE_COUNT
 } weather_clock_page_t;
 
@@ -40,14 +54,18 @@ typedef enum
 void weather_clock_show_boot(void);
 void weather_clock_show_wifi_status(bool ok);
 void weather_clock_show_error(const char *message);
-void weather_clock_show_main(const clock_time_t *time, const weather_clock_sensor_t *sensor);
-void weather_clock_show_network(const char *ip, bool wifi_ok, bool sntp_ok, const clock_time_t *last_sync);
+void weather_clock_show_main(const clock_time_t *time, const weather_clock_sensor_t *sensor,
+                             const weather_clock_weather_t *weather);
+void weather_clock_show_network(const char *ip, bool wifi_ok, bool sntp_ok,
+                                const weather_clock_weather_t *weather);
 void weather_clock_show_sensor(const weather_clock_sensor_t *sensor);
+void weather_clock_show_weather(const weather_clock_weather_t *weather);
 void weather_clock_show_page(weather_clock_page_t page, const char *ip, const clock_time_t *time,
                              const clock_time_t *last_sync, const weather_clock_sensor_t *sensor,
-                             bool wifi_ok, bool sntp_ok);
+                             const weather_clock_weather_t *weather, bool wifi_ok, bool sntp_ok);
 void weather_clock_update_time(weather_clock_page_t page, const clock_time_t *time);
 void weather_clock_update_sensor(weather_clock_page_t page, const weather_clock_sensor_t *sensor);
+void weather_clock_update_weather(weather_clock_page_t page, const weather_clock_weather_t *weather);
 void weather_clock_update_status(const char *status);
 
 #endif /* __WEATHER_CLOCK_UI_H__ */

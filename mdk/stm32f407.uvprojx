@@ -406,6 +406,11 @@
               <FilePath>..\app\weather.c</FilePath>
             </File>
             <File>
+              <FileName>weather_api.c</FileName>
+              <FileType>1</FileType>
+              <FilePath>..\app\weather_api.c</FilePath>
+            </File>
+            <File>
               <FileName>app.c</FileName>
               <FileType>1</FileType>
               <FilePath>..\app\app.c</FilePath>

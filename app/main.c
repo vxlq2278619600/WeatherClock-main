@@ -15,6 +15,8 @@
 #include "rtc.h"
 #include "weather_clock_ui.h"
 #include "button.h"
+#include "weather_api.h"
+#include "weather_config.h"
 
 #define ENABLE_LCD_SELF_TEST       0
 #define ENABLE_AHT20_LCD_TEST      0
@@ -36,6 +38,7 @@
 #define ESP_AT_BUTTON_POLL_MS          50
 #define AHT20_SENSOR_REFRESH_MS        2000
 #define ESP_AT_TIME_RESYNC_MS          (30 * 60 * 1000)
+#define WEATHER_UPDATE_MS              (30 * 60 * 1000)
 
 extern void board_lowlevel_init(void);
 extern void board_init(void);
@@ -414,6 +417,42 @@ static void weather_clock_read_sensor(weather_clock_sensor_t *sensor)
     printf("[AHT20] read FAIL\r\n");
 }
 
+static void weather_clock_copy_weather(weather_clock_weather_t *dst, const weather_api_info_t *src)
+{
+    if (dst == NULL || src == NULL)
+        return;
+
+    snprintf(dst->city, sizeof(dst->city), "%s", src->city);
+    snprintf(dst->weather, sizeof(dst->weather), "%s", src->weather);
+    snprintf(dst->temperature, sizeof(dst->temperature), "%s", src->temperature);
+    snprintf(dst->humidity, sizeof(dst->humidity), "%s", src->humidity);
+    snprintf(dst->winddirection, sizeof(dst->winddirection), "%s", src->winddirection);
+    snprintf(dst->windpower, sizeof(dst->windpower), "%s", src->windpower);
+    snprintf(dst->reporttime, sizeof(dst->reporttime), "%s", src->reporttime);
+    dst->valid = src->valid;
+    dst->last_fail = 0;
+}
+
+static bool weather_clock_fetch_weather(weather_clock_weather_t *weather)
+{
+    weather_api_info_t api_weather = { 0 };
+
+    if (weather_api_fetch(&api_weather) > 0 && api_weather.valid != 0)
+    {
+        weather_clock_copy_weather(weather, &api_weather);
+        return true;
+    }
+
+    if (weather != NULL)
+    {
+        if (weather->city[0] == '\0')
+            snprintf(weather->city, sizeof(weather->city), "%s", WEATHER_CITY_NAME);
+        weather->last_fail = 1;
+    }
+
+    return false;
+}
+
 static bool esp_at_self_test(void)
 {
     printf("[ESP TEST] wait ESP boot...\r\n");
@@ -569,6 +608,7 @@ static void ESP_AT_BasicTest(void)
         clock_time_t clock_time = { 0 };
         clock_time_t last_sync_time = { 0 };
         weather_clock_sensor_t sensor = { 0 };
+        weather_clock_weather_t weather = { 0 };
         weather_clock_page_t current_page = WEATHER_CLOCK_PAGE_MAIN;
         const char *failed_stage = "WIFI FAIL";
         bool wifi_ok = false;
@@ -576,6 +616,7 @@ static void ESP_AT_BasicTest(void)
         bool sensor_init_ok = false;
 
         weather_clock_show_boot();
+        weather_api_init();
 
         printf("[ESP TEST] start\r\n");
         printf("[ESP TEST] UART2 init: 115200 8N1\r\n");
@@ -618,12 +659,16 @@ static void ESP_AT_BasicTest(void)
         {
             weather_clock_read_sensor(&sensor);
         }
-        weather_clock_show_page(current_page, ip, &clock_time, &last_sync_time, &sensor, wifi_ok, sntp_ok);
+        weather_clock_show_page(current_page, ip, &clock_time, &last_sync_time, &sensor, &weather, wifi_ok, sntp_ok);
         printf("[ESP TEST] MAIN UI START\r\n");
+
+        weather_clock_fetch_weather(&weather);
+        weather_clock_show_page(current_page, ip, &clock_time, &last_sync_time, &sensor, &weather, wifi_ok, sntp_ok);
 
         TickType_t last_sync_tick = xTaskGetTickCount();
         TickType_t last_time_update_tick = 0;
         TickType_t last_sensor_update_tick = xTaskGetTickCount();
+        TickType_t last_weather_update_tick = xTaskGetTickCount();
 
         while (1)
         {
@@ -633,7 +678,7 @@ static void ESP_AT_BasicTest(void)
             {
                 current_page = (weather_clock_page_t)((current_page + 1) % WEATHER_CLOCK_PAGE_COUNT);
                 printf("[UI] Switch page: %d\r\n", current_page);
-                weather_clock_show_page(current_page, ip, &clock_time, &last_sync_time, &sensor, wifi_ok, sntp_ok);
+                weather_clock_show_page(current_page, ip, &clock_time, &last_sync_time, &sensor, &weather, wifi_ok, sntp_ok);
             }
 
             if (last_time_update_tick == 0 ||
@@ -671,6 +716,19 @@ static void ESP_AT_BasicTest(void)
                 last_sensor_update_tick = now_tick;
             }
 
+            if ((now_tick - last_weather_update_tick) >= pdMS_TO_TICKS(WEATHER_UPDATE_MS))
+            {
+                if (weather_clock_fetch_weather(&weather))
+                {
+                    weather_clock_show_page(current_page, ip, &clock_time, &last_sync_time, &sensor, &weather, wifi_ok, sntp_ok);
+                }
+                else
+                {
+                    weather_clock_show_page(current_page, ip, &clock_time, &last_sync_time, &sensor, &weather, wifi_ok, sntp_ok);
+                }
+                last_weather_update_tick = xTaskGetTickCount();
+            }
+
             if ((now_tick - last_sync_tick) >= pdMS_TO_TICKS(ESP_AT_TIME_RESYNC_MS))
             {
                 printf("[ESP TEST] periodic time resync start\r\n");
@@ -679,13 +737,13 @@ static void ESP_AT_BasicTest(void)
                     clock_time_from_rtc(&date_time, &clock_time);
                     last_sync_time = clock_time;
                     sntp_ok = true;
-                    weather_clock_show_page(current_page, ip, &clock_time, &last_sync_time, &sensor, wifi_ok, sntp_ok);
+                    weather_clock_show_page(current_page, ip, &clock_time, &last_sync_time, &sensor, &weather, wifi_ok, sntp_ok);
                     printf("[ESP TEST] periodic time resync ok\r\n");
                 }
                 else
                 {
                     sntp_ok = false;
-                    weather_clock_show_page(current_page, ip, &clock_time, &last_sync_time, &sensor, wifi_ok, sntp_ok);
+                    weather_clock_show_page(current_page, ip, &clock_time, &last_sync_time, &sensor, &weather, wifi_ok, sntp_ok);
                     printf("[ESP TEST] periodic time resync failed\r\n");
                 }
                 last_sync_tick = xTaskGetTickCount();

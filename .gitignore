@@ -4,6 +4,7 @@
 
 # local wifi credentials
 /app/wifi_config.h
+/app/weather_config.h
 
 # ugreen nas sync
 **/@eaDir

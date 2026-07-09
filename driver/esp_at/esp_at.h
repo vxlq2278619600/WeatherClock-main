@@ -27,6 +27,7 @@ typedef struct
 bool esp_at_init(void);
 bool esp_at_command(const char *command, uint32_t timeout);
 const char *esp_at_last_response(void);
+bool esp_at_send_raw(const char *data, uint32_t len);
 bool esp_at_echo_off(void);
 bool esp_at_wifi_init(void);
 bool esp_at_connect_wifi(const char *ssid, const char *pwd, const char *mac);
@@ -39,5 +40,10 @@ bool parse_sntp_time(const char *response, esp_date_time_t *date);
 bool esp_at_sntp_init(void);
 bool esp_at_sntp_get_time(esp_date_time_t *date);
 const char *esp_at_http_get(const char *url);
+bool esp_at_http_get_transport(const char *transport, const char *host, uint16_t port,
+                               const char *request, char *response,
+                               uint32_t response_size, uint32_t timeout_ms);
+bool esp_at_tcp_http_get(const char *host, uint16_t port, const char *request,
+                         char *response, uint32_t response_size, uint32_t timeout_ms);
 
 #endif /* __ESP_AT_H__ */
