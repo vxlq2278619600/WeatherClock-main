@@ -30,6 +30,7 @@
 #define ESP_AT_TEST_RETRY_DELAY_MS     3000
 #define ESP_AT_TEST_SHORT_TIMEOUT_MS   2000
 #define ESP_AT_TEST_GMR_TIMEOUT_MS     3000
+#define ESP_AT_TIME_REFRESH_MS         1000
 
 extern void board_lowlevel_init(void);
 extern void board_init(void);
@@ -317,6 +318,30 @@ static void ESP_AT_LCD_ShowTemplate(void)
     ESP_AT_LCD_ShowStatus("IP", "...", 264, fg_color);
 }
 
+static void ESP_AT_LCD_ShowClockTemplate(const char *ip)
+{
+    const uint16_t bg_color = 0x0000;
+    const uint16_t fg_color = 0xFFFF;
+
+    ui_fill_color(0, 0, UI_WIDTH - 1, UI_HEIGHT - 1, bg_color);
+    ui_write_string(20, 34, "Weather Clock", fg_color, bg_color, &font24_maple_bold);
+    ESP_AT_LCD_ShowStatus("WIFI", "OK", 96, mkcolor(120, 255, 120));
+    ESP_AT_LCD_ShowStatus("IP", ip, 126, mkcolor(120, 255, 120));
+    ESP_AT_LCD_ShowStatus("TIME", "--:--:--", 176, mkcolor(0, 255, 234));
+    ESP_AT_LCD_ShowStatus("DATE", "----/--/--", 206, fg_color);
+}
+
+static void ESP_AT_LCD_ShowClockTime(const rtc_date_time_t *date)
+{
+    char time_text[16];
+    char date_text[16];
+
+    snprintf(time_text, sizeof(time_text), "%02u:%02u:%02u", date->hour, date->minute, date->second);
+    snprintf(date_text, sizeof(date_text), "%04u-%02u-%02u", date->year, date->month, date->day);
+    ESP_AT_LCD_ShowStatus("TIME", time_text, 176, mkcolor(0, 255, 234));
+    ESP_AT_LCD_ShowStatus("DATE", date_text, 206, 0xFFFF);
+}
+
 static void esp_test_log_response(void)
 {
     printf("[ESP TEST] Response:\r\n%s\r\n", esp_at_last_response());
@@ -420,11 +445,64 @@ static bool esp_at_wifi_connect(char *ip, uint32_t ip_size, const char **failed_
     return true;
 }
 
+static bool esp_at_sntp_sync_clock(rtc_date_time_t *date_time)
+{
+    const TickType_t retry_ticks = pdMS_TO_TICKS(1000);
+    const TickType_t timeout_ticks = pdMS_TO_TICKS(SNTP_SYNC_TIMEOUT_MS);
+    TickType_t start_tick = xTaskGetTickCount();
+
+    ESP_AT_LCD_ShowProgress("Config SNTP...", mkcolor(255, 255, 0));
+    printf("[ESP TEST] Send: AT+CIPSNTPCFG=1,8,\"ntp.aliyun.com\",\"cn.ntp.org.cn\",\"pool.ntp.org\"\r\n");
+    if (!esp_at_sntp_config())
+    {
+        esp_test_log_response();
+        printf("[ESP TEST] SNTP CFG FAIL\r\n");
+        ESP_AT_LCD_ShowProgress("SNTP CFG FAIL", mkcolor(255, 80, 80));
+        return false;
+    }
+    esp_test_log_response();
+    printf("[ESP TEST] SNTP CFG OK\r\n");
+
+    ESP_AT_LCD_ShowProgress("Getting time...", mkcolor(255, 255, 0));
+    while ((xTaskGetTickCount() - start_tick) < timeout_ticks)
+    {
+        esp_date_time_t esp_date = { 0 };
+
+        printf("[ESP TEST] Send: AT+CIPSNTPTIME?\r\n");
+        if (esp_at_get_time(&esp_date))
+        {
+            esp_test_log_response();
+
+            date_time->year = esp_date.year;
+            date_time->month = esp_date.month;
+            date_time->day = esp_date.day;
+            date_time->hour = esp_date.hour;
+            date_time->minute = esp_date.minute;
+            date_time->second = esp_date.second;
+            date_time->weekday = esp_date.weekday;
+            rtc_set_time(date_time);
+
+            printf("[ESP TEST] TIME OK: %04u-%02u-%02u %02u:%02u:%02u\r\n",
+                date_time->year, date_time->month, date_time->day,
+                date_time->hour, date_time->minute, date_time->second);
+            return true;
+        }
+
+        esp_test_log_response();
+        vTaskDelay(retry_ticks);
+    }
+
+    printf("[ESP TEST] TIME FAIL\r\n");
+    ESP_AT_LCD_ShowProgress("TIME FAIL", mkcolor(255, 80, 80));
+    return false;
+}
+
 static void ESP_AT_BasicTest(void)
 {
     while (1)
     {
         char ip[32];
+        rtc_date_time_t date_time = { 0 };
         const char *failed_stage = "WIFI FAIL";
 
         ESP_AT_LCD_ShowTemplate();
@@ -451,9 +529,23 @@ static void ESP_AT_BasicTest(void)
         ESP_AT_LCD_ShowStatus("IP", ip, 264, mkcolor(120, 255, 120));
         ESP_AT_LCD_ShowProgress("WiFi Ready", mkcolor(120, 255, 120));
 
+        if (!esp_at_sntp_sync_clock(&date_time))
+        {
+            vTaskDelay(pdMS_TO_TICKS(ESP_AT_TEST_RETRY_DELAY_MS));
+            continue;
+        }
+
+        ESP_AT_LCD_ShowClockTemplate(ip);
+        ESP_AT_LCD_ShowClockTime(&date_time);
+
         while (1)
         {
-            vTaskDelay(pdMS_TO_TICKS(1000));
+            rtc_get_time(&date_time);
+            if (date_time.year >= 2000)
+            {
+                ESP_AT_LCD_ShowClockTime(&date_time);
+            }
+            vTaskDelay(pdMS_TO_TICKS(ESP_AT_TIME_REFRESH_MS));
         }
     }
 }

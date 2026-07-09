@@ -338,12 +338,17 @@ bool wifi_is_connected(void)
     return false;
 }
 
-bool esp_at_sntp_init(void)
+bool esp_at_sntp_config(void)
 {
-    if (!esp_at_write_command("AT+CIPSNTPCFG=1,8", 2000))
+    if (!esp_at_write_command("AT+CIPSNTPCFG=1,8,\"ntp.aliyun.com\",\"cn.ntp.org.cn\",\"pool.ntp.org\"", 3000))
         return false;
 
     return true;
+}
+
+bool esp_at_sntp_init(void)
+{
+    return esp_at_sntp_config();
 }
 
 static uint8_t month_str_to_num(const char *month_str)
@@ -373,10 +378,13 @@ static uint8_t weekday_str_to_num(const char *weekday_str)
     return 0;
 }
 
-static bool parse_cipsntptime_response(const char *response, esp_date_time_t *date)
+bool parse_sntp_time(const char *response, esp_date_time_t *date)
 {
     char weekday_str[8];
     char month_str[4];
+
+    if (response == NULL || date == NULL)
+        return false;
 
     response = strstr(response, "+CIPSNTPTIME:");
     if (response == NULL)
@@ -390,18 +398,25 @@ static bool parse_cipsntptime_response(const char *response, esp_date_time_t *da
     date->weekday = weekday_str_to_num(weekday_str);
     date->month = month_str_to_num(month_str);
 
+    return date->year >= 2000 && date->month >= 1 && date->month <= 12 &&
+        date->day >= 1 && date->day <= 31 &&
+        date->hour <= 23 && date->minute <= 59 && date->second <= 59;
+}
+
+bool esp_at_get_time(esp_date_time_t *date)
+{
+    if (!esp_at_write_command("AT+CIPSNTPTIME?", 3000))
+        return false;
+
+    if (!parse_sntp_time(esp_at_last_response(), date))
+        return false;
+
     return true;
 }
 
 bool esp_at_sntp_get_time(esp_date_time_t *date)
 {
-    if (!esp_at_write_command("AT+CIPSNTPTIME?", 2000))
-        return false;
-
-    if (!parse_cipsntptime_response(esp_at_last_response(), date))
-        return false;
-
-    return true;
+    return esp_at_get_time(date);
 }
 
 const char *esp_at_http_get(const char *url)
