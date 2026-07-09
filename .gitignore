@@ -2,5 +2,8 @@
 /mdk/*
 !/mdk/*.uvprojx
 
+# local wifi credentials
+/app/wifi_config.h
+
 # ugreen nas sync
 **/@eaDir

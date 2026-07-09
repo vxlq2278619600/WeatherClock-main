@@ -43,7 +43,7 @@ void wifi_wait_connect(void)
 {
     printf("[WIFI] connecting\n");
     
-    esp_at_connect_wifi(WIFI_SSID, WIFI_PASSWD, NULL);
+    esp_at_connect_wifi(WIFI_SSID, WIFI_PASSWORD, NULL);
     
     for (uint32_t t = 0; t < 10 * 1000; t += 100)
     {

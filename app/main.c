@@ -2,6 +2,7 @@
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdlib.h>
+#include <string.h>
 #include "FreeRTOS.h"
 #include "task.h"
 #include "workqueue.h"
@@ -15,7 +16,8 @@
 
 #define ENABLE_LCD_SELF_TEST       0
 #define ENABLE_AHT20_LCD_TEST      0
-#define ENABLE_WIFI_SNTP_LCD_TEST  1
+#define ENABLE_WIFI_SNTP_LCD_TEST  0
+#define ENABLE_ESP_AT_BASIC_TEST   1
 
 #define LCD_TEST_PAGE_DELAY_MS         1000
 #define AHT20_LCD_REFRESH_MS           2000
@@ -25,6 +27,9 @@
 #define SNTP_SYNC_TIMEOUT_MS           15000
 #define WIFI_TEST_AHT20_REFRESH_MS     5000
 #define WIFI_TEST_LINK_CHECK_MS        5000
+#define ESP_AT_TEST_RETRY_DELAY_MS     3000
+#define ESP_AT_TEST_SHORT_TIMEOUT_MS   2000
+#define ESP_AT_TEST_GMR_TIMEOUT_MS     3000
 
 extern void board_lowlevel_init(void);
 extern void board_init(void);
@@ -275,6 +280,184 @@ static void WiFi_SNTP_LCD_ShowIndoorData(int temperature_tenths, int humidity_te
     lcd_write_row(288, 24, line, mkcolor(120, 255, 120), &font20_maple_bold);
 }
 
+static void ESP_AT_LCD_ShowLine(uint16_t y, const char *text, uint16_t color)
+{
+    const uint16_t bg_color = 0x0000;
+
+    ui_fill_color(0, y, UI_WIDTH - 1, y + 24, bg_color);
+    ui_write_string(20, y, text, color, bg_color, &font20_maple_bold);
+}
+
+static void ESP_AT_LCD_ShowProgress(const char *text, uint16_t color)
+{
+    ESP_AT_LCD_ShowLine(120, text, color);
+}
+
+static void ESP_AT_LCD_ShowStatus(const char *label, const char *value, uint16_t y, uint16_t color)
+{
+    char line[48];
+
+    snprintf(line, sizeof(line), "%s: %s", label, value);
+    ESP_AT_LCD_ShowLine(y, line, color);
+}
+
+static void ESP_AT_LCD_ShowTemplate(void)
+{
+    const uint16_t bg_color = 0x0000;
+    const uint16_t fg_color = 0xFFFF;
+
+    ui_fill_color(0, 0, UI_WIDTH - 1, UI_HEIGHT - 1, bg_color);
+    ui_write_string(20, 36, "Weather Clock", fg_color, bg_color, &font24_maple_bold);
+    ui_write_string(20, 92, "ESP AT TEST", mkcolor(255, 255, 0), bg_color, &font32_maple_bold);
+    ESP_AT_LCD_ShowProgress("Testing...", mkcolor(0, 255, 234));
+    ESP_AT_LCD_ShowStatus("ESP AT", "...", 160, fg_color);
+    ESP_AT_LCD_ShowStatus("GMR", "...", 186, fg_color);
+    ESP_AT_LCD_ShowStatus("MODE", "...", 212, fg_color);
+    ESP_AT_LCD_ShowStatus("WIFI", "...", 238, fg_color);
+    ESP_AT_LCD_ShowStatus("IP", "...", 264, fg_color);
+}
+
+static void esp_test_log_response(void)
+{
+    printf("[ESP TEST] Response:\r\n%s\r\n", esp_at_last_response());
+}
+
+static bool esp_at_self_test(void)
+{
+    printf("[ESP TEST] wait ESP boot...\r\n");
+    if (!esp_at_init())
+    {
+        printf("[ESP TEST] ESP init failed\r\n");
+        return false;
+    }
+
+    ESP_AT_LCD_ShowProgress("Sending AT...", mkcolor(255, 255, 0));
+    printf("[ESP TEST] Send: AT\r\n");
+    if (!esp_at_command("AT", ESP_AT_TEST_SHORT_TIMEOUT_MS))
+    {
+        esp_test_log_response();
+        printf("[ESP TEST] ESP AT FAIL\r\n");
+        return false;
+    }
+    esp_test_log_response();
+    printf("[ESP TEST] ESP AT OK\r\n");
+
+    ESP_AT_LCD_ShowStatus("ESP AT", "OK", 160, mkcolor(120, 255, 120));
+    ESP_AT_LCD_ShowProgress("Reading GMR...", mkcolor(255, 255, 0));
+    printf("[ESP TEST] Send: AT+GMR\r\n");
+    if (!esp_at_command("AT+GMR", ESP_AT_TEST_GMR_TIMEOUT_MS))
+    {
+        esp_test_log_response();
+        printf("[ESP TEST] GMR FAIL\r\n");
+        return false;
+    }
+    esp_test_log_response();
+    printf("[ESP TEST] GMR OK\r\n");
+
+    ESP_AT_LCD_ShowStatus("GMR", "OK", 186, mkcolor(120, 255, 120));
+    return true;
+}
+
+static bool esp_at_wifi_connect(char *ip, uint32_t ip_size, const char **failed_stage)
+{
+    if (failed_stage != NULL)
+        *failed_stage = "WIFI FAIL";
+
+    ESP_AT_LCD_ShowProgress("Sending ATE0...", mkcolor(255, 255, 0));
+    printf("[ESP TEST] Send: ATE0\r\n");
+    if (!esp_at_echo_off())
+    {
+        esp_test_log_response();
+        printf("[ESP TEST] ATE0 FAIL\r\n");
+        if (failed_stage != NULL)
+            *failed_stage = "ATE0 FAIL";
+        return false;
+    }
+    esp_test_log_response();
+
+    ESP_AT_LCD_ShowProgress("Setting mode...", mkcolor(255, 255, 0));
+    printf("[ESP TEST] Send: AT+CWMODE=1\r\n");
+    if (!esp_at_wifi_init())
+    {
+        esp_test_log_response();
+        printf("[ESP TEST] WIFI MODE FAIL\r\n");
+        if (failed_stage != NULL)
+            *failed_stage = "MODE FAIL";
+        return false;
+    }
+    esp_test_log_response();
+    printf("[ESP TEST] WIFI MODE OK\r\n");
+    ESP_AT_LCD_ShowStatus("MODE", "OK", 212, mkcolor(120, 255, 120));
+
+    ESP_AT_LCD_ShowProgress("Joining hotspot...", mkcolor(255, 255, 0));
+    printf("[ESP TEST] Send: AT+CWJAP=\"%s\",\"******\"\r\n", WIFI_SSID);
+    if (!esp_at_connect_wifi(WIFI_SSID, WIFI_PASSWORD, NULL))
+    {
+        esp_test_log_response();
+        printf("[ESP TEST] WIFI JOIN FAIL\r\n");
+        if (failed_stage != NULL)
+            *failed_stage = "WIFI FAIL";
+        return false;
+    }
+    esp_test_log_response();
+    printf("[ESP TEST] WIFI JOIN OK\r\n");
+    ESP_AT_LCD_ShowStatus("WIFI", "OK", 238, mkcolor(120, 255, 120));
+
+    ESP_AT_LCD_ShowProgress("Getting IP...", mkcolor(255, 255, 0));
+    printf("[ESP TEST] Send: AT+CIFSR\r\n");
+    if (!esp_at_get_ip(ip, ip_size))
+    {
+        esp_test_log_response();
+        printf("[ESP TEST] GET IP FAIL\r\n");
+        if (failed_stage != NULL)
+            *failed_stage = "IP FAIL";
+        return false;
+    }
+    esp_test_log_response();
+    printf("[ESP TEST] IP OK\r\n");
+    printf("[ESP TEST] IP: %s\r\n", ip);
+
+    return true;
+}
+
+static void ESP_AT_BasicTest(void)
+{
+    while (1)
+    {
+        char ip[32];
+        const char *failed_stage = "WIFI FAIL";
+
+        ESP_AT_LCD_ShowTemplate();
+
+        printf("[ESP TEST] start\r\n");
+        printf("[ESP TEST] UART2 init: 115200 8N1\r\n");
+        printf("[ESP TEST] STM32 PA2 / USART2_TX -> ESP32-C3 GPIO6 / AT_RX\r\n");
+        printf("[ESP TEST] STM32 PA3 / USART2_RX -> ESP32-C3 GPIO7 / AT_TX\r\n");
+
+        if (!esp_at_self_test())
+        {
+            ESP_AT_LCD_ShowProgress("AT OR GMR FAIL", mkcolor(255, 80, 80));
+            vTaskDelay(pdMS_TO_TICKS(ESP_AT_TEST_RETRY_DELAY_MS));
+            continue;
+        }
+
+        if (!esp_at_wifi_connect(ip, sizeof(ip), &failed_stage))
+        {
+            ESP_AT_LCD_ShowProgress(failed_stage, mkcolor(255, 80, 80));
+            vTaskDelay(pdMS_TO_TICKS(ESP_AT_TEST_RETRY_DELAY_MS));
+            continue;
+        }
+
+        ESP_AT_LCD_ShowStatus("IP", ip, 264, mkcolor(120, 255, 120));
+        ESP_AT_LCD_ShowProgress("WiFi Ready", mkcolor(120, 255, 120));
+
+        while (1)
+        {
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+    }
+}
+
 static bool sntp_sync_rtc(void)
 {
     const TickType_t retry_ticks = pdMS_TO_TICKS(1000);
@@ -387,7 +570,7 @@ static void WiFi_SNTP_LCD_Test(void)
 
         WiFi_SNTP_LCD_ShowWiFi("Connecting...", mkcolor(255, 255, 0));
         printf("[WIFI TEST] WiFi connecting...\r\n");
-        if (!esp_at_connect_wifi(WIFI_SSID, WIFI_PASSWD, NULL))
+        if (!esp_at_connect_wifi(WIFI_SSID, WIFI_PASSWORD, NULL))
         {
             printf("[WIFI TEST] AT command no response\r\n");
             WiFi_SNTP_LCD_ShowWiFi("CONNECT CMD ERR", mkcolor(255, 80, 80));
@@ -474,6 +657,15 @@ static void WiFi_SNTP_LCD_Test(void)
 static void main_init(void *param)
 {
     (void)param;
+#if !ENABLE_LCD_SELF_TEST
+    (void)ST7789_DisplaySelfTest;
+#endif
+#if !ENABLE_AHT20_LCD_TEST
+    (void)AHT20_LCD_Test;
+#endif
+#if !ENABLE_WIFI_SNTP_LCD_TEST
+    (void)WiFi_SNTP_LCD_Test;
+#endif
 
     board_init();
     ui_init();
@@ -482,7 +674,9 @@ static void main_init(void *param)
     ST7789_DisplaySelfTest();
 #endif
 
-#if ENABLE_WIFI_SNTP_LCD_TEST
+#if ENABLE_ESP_AT_BASIC_TEST
+    ESP_AT_BasicTest();
+#elif ENABLE_WIFI_SNTP_LCD_TEST
     WiFi_SNTP_LCD_Test();
 #elif ENABLE_AHT20_LCD_TEST
     AHT20_LCD_Test();

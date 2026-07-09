@@ -2,16 +2,16 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
-#include <time.h>
 #include "FreeRTOS.h"
 #include "task.h"
 #include "semphr.h"
 #include "stm32f4xx.h"
 #include "esp_at.h"
 
-#define ESP_AT_DEBUG    1
-
-#define ARRAY_SIZE(arr) (sizeof(arr) / sizeof((arr)[0]))
+#define ESP_AT_DEBUG             1
+#define ESP_AT_BOOT_WAIT_MS      2000
+#define ESP_AT_BOOT_RETRY_COUNT  5
+#define ESP_AT_BOOT_RETRY_MS     500
 
 typedef enum
 {
@@ -22,35 +22,29 @@ typedef enum
     AT_ACK_READY,
 } at_ack_t;
 
-typedef struct
-{
-    at_ack_t ack;
-    const char *string;
-} at_ack_match_t;
-
-static const at_ack_match_t at_ack_matches[] = 
-{
-    {AT_ACK_OK, "OK\r\n"},
-    {AT_ACK_ERROR, "ERROR\r\n"},
-    {AT_ACK_BUSY, "busy p¡­\r\n"},
-    {AT_ACK_READY, "ready\r\n"},
-};
-
 static char *rxline;
 static char rxbuf[1024];
+static char txbuf[1024];
 static uint32_t rxlen;
 static at_ack_t rxack;
 static SemaphoreHandle_t at_ack_sempahore;
 
+static at_ack_t esp_at_execute_command(const char *command, uint32_t timeout);
 static bool esp_at_write_command(const char *command, uint32_t timeout);
 static bool esp_at_wait_boot(uint32_t timeout);
-static bool esp_at_wait_ready(uint32_t timeout);
+static void esp_at_usart_write(const char *data);
+static at_ack_t match_internal_ack(const char *str);
+static at_ack_t esp_at_usart_wait_receive(uint32_t timeout);
 
 static void esp_at_io_init(void)
 {
+    /* STM32 USART2:
+     * PA2 -> USART2_TX -> ESP32-C3 GPIO6 / AT_RX
+     * PA3 -> USART2_RX -> ESP32-C3 GPIO7 / AT_TX
+     */
     GPIO_PinAFConfig(GPIOA, GPIO_PinSource2, GPIO_AF_USART2);
     GPIO_PinAFConfig(GPIOA, GPIO_PinSource3, GPIO_AF_USART2);
-    
+
     GPIO_InitTypeDef GPIO_InitStructure;
     GPIO_StructInit(&GPIO_InitStructure);
     GPIO_InitStructure.GPIO_Mode = GPIO_Mode_AF;
@@ -70,7 +64,7 @@ static void esp_at_usart_init(void)
     USART_InitStructure.USART_Parity = USART_Parity_No;
     USART_InitStructure.USART_StopBits = USART_StopBits_1;
     USART_InitStructure.USART_WordLength = USART_WordLength_8b;
-    
+
     USART_Init(USART2, &USART_InitStructure);
     USART_DMACmd(USART2, USART_DMAReq_Tx, ENABLE);
     USART_ITConfig(USART2, USART_IT_RXNE, ENABLE);
@@ -118,25 +112,64 @@ static void esp_at_lowlevel_init(void)
 
 bool esp_at_init(void)
 {
-    at_ack_sempahore = xSemaphoreCreateBinary();
-    configASSERT(at_ack_sempahore);
-    
+    if (at_ack_sempahore == NULL)
+    {
+        at_ack_sempahore = xSemaphoreCreateBinary();
+        configASSERT(at_ack_sempahore);
+    }
+
     esp_at_lowlevel_init();
-    
-    if (!esp_at_wait_boot(3000))
-        return false;
-    if (!esp_at_write_command("AT+RESTORE\r\n", 2000))
-        return false;
-    if (!esp_at_wait_ready(5000))
-        return false;
-    
-    return true;
+    return esp_at_wait_boot(ESP_AT_BOOT_WAIT_MS + ESP_AT_BOOT_RETRY_COUNT * ESP_AT_BOOT_RETRY_MS);
+}
+
+static int esp_at_append_crlf(char *dst, size_t dst_size, const char *command)
+{
+    size_t len;
+
+    if (dst == NULL || command == NULL || dst_size == 0)
+        return 0;
+
+    len = strlen(command);
+    if (len >= 2 && command[len - 2] == '\r' && command[len - 1] == '\n')
+        return snprintf(dst, dst_size, "%s", command);
+
+    return snprintf(dst, dst_size, "%s\r\n", command);
+}
+
+static at_ack_t esp_at_execute_command(const char *command, uint32_t timeout)
+{
+    if (esp_at_append_crlf(txbuf, sizeof(txbuf), command) <= 0)
+        return AT_ACK_NONE;
+
+#if ESP_AT_DEBUG
+    printf("[DEBUG] Send: %s", txbuf);
+#endif
+
+    esp_at_usart_write(txbuf);
+    rxack = AT_ACK_NONE;
+    at_ack_t ack = esp_at_usart_wait_receive(timeout);
+
+#if ESP_AT_DEBUG
+    printf("[DEBUG] Response:\r\n%s\r\n", rxbuf);
+#endif
+
+    return ack;
+}
+
+static bool esp_at_write_command(const char *command, uint32_t timeout)
+{
+    return esp_at_execute_command(command, timeout) == AT_ACK_OK;
+}
+
+const char *esp_at_last_response(void)
+{
+    return rxbuf;
 }
 
 static void esp_at_usart_write(const char *data)
 {
     uint32_t len = strlen(data);
-    
+
     DMA1_Stream6->M0AR = (uint32_t)data;
     DMA1_Stream6->NDTR = len;
 
@@ -146,12 +179,15 @@ static void esp_at_usart_write(const char *data)
 
 static at_ack_t match_internal_ack(const char *str)
 {
-    for (uint32_t i = 0; i < ARRAY_SIZE(at_ack_matches); i++)
-    {
-        if (strcmp(str, at_ack_matches[i].string) == 0)
-            return at_ack_matches[i].ack;
-    }
-    
+    if (strstr(str, "OK\r\n") != NULL)
+        return AT_ACK_OK;
+    if (strstr(str, "ERROR\r\n") != NULL)
+        return AT_ACK_ERROR;
+    if (strstr(str, "busy p") != NULL)
+        return AT_ACK_BUSY;
+    if (strstr(str, "ready") != NULL)
+        return AT_ACK_READY;
+
     return AT_ACK_NONE;
 }
 
@@ -159,118 +195,138 @@ static at_ack_t esp_at_usart_wait_receive(uint32_t timeout)
 {
     rxlen = 0;
     rxline = rxbuf;
-    
+
     bool acked = xSemaphoreTake(at_ack_sempahore, pdMS_TO_TICKS(timeout)) == pdPASS;
     return acked ? rxack : AT_ACK_NONE;
 }
 
-static bool esp_at_wait_ready(uint32_t timeout)
-{
-    return esp_at_usart_wait_receive(timeout) == AT_ACK_READY;
-}
-
-static bool esp_at_write_command(const char *command, uint32_t timeout)
-{
-#if ESP_AT_DEBUG
-    printf("[DEBUG] Send: %s\n", command);
-#endif
-
-    esp_at_usart_write(command);
-    at_ack_t ack = esp_at_usart_wait_receive(timeout);
-
-#if ESP_AT_DEBUG
-    printf("[DEBUG] Response:\n%s\n", rxbuf);
-#endif
-
-    return ack == AT_ACK_OK;
-}
-
-static const char *esp_at_get_response(void)
-{
-    return rxbuf;
-}
-
 static bool esp_at_wait_boot(uint32_t timeout)
 {
-    for (int t = 0; t < timeout; t += 100)
+    (void)timeout;
+
+    vTaskDelay(pdMS_TO_TICKS(ESP_AT_BOOT_WAIT_MS));
+
+    for (int attempt = 0; attempt < ESP_AT_BOOT_RETRY_COUNT; attempt++)
     {
-        if (esp_at_write_command("AT\r\n", 100))
+        at_ack_t ack = esp_at_execute_command("AT", 1000);
+        if (ack == AT_ACK_OK)
             return true;
+
+        vTaskDelay(pdMS_TO_TICKS(ESP_AT_BOOT_RETRY_MS));
     }
-    
+
     return false;
+}
+
+bool esp_at_command(const char *command, uint32_t timeout)
+{
+    return esp_at_write_command(command, timeout);
+}
+
+bool esp_at_echo_off(void)
+{
+    return esp_at_write_command("ATE0", 2000);
 }
 
 bool esp_at_wifi_init(void)
 {
-    return esp_at_write_command("AT+CWMODE=1\r\n", 2000);
+    return esp_at_write_command("AT+CWMODE=1", 2000);
 }
 
 bool esp_at_connect_wifi(const char *ssid, const char *pwd, const char *mac)
 {
+    int len;
+
     if (ssid == NULL || pwd == NULL)
         return false;
-    
-    char *cmd = rxbuf;
-    int len = snprintf(cmd, sizeof(rxbuf), "AT+CWJAP=\"%s\",\"%s\"\r\n", ssid, pwd);
-    if (mac)
-        snprintf(cmd + len, sizeof(rxbuf) - len, ",\"%s\"", mac);
-    
-    return esp_at_write_command(cmd, 5000);
+
+    len = snprintf(txbuf, sizeof(txbuf), "AT+CWJAP=\"%s\",\"%s\"", ssid, pwd);
+    if (mac != NULL)
+        snprintf(txbuf + len, sizeof(txbuf) - len, ",\"%s\"", mac);
+
+    return esp_at_write_command(txbuf, 20000);
+}
+
+static bool parse_cifsr_response(const char *response, char *ip, uint32_t ip_size)
+{
+    const char *staip = strstr(response, "+CIFSR:STAIP,");
+    const char *start;
+    const char *end;
+    uint32_t len;
+
+    if (staip == NULL || ip == NULL || ip_size == 0)
+        return false;
+
+    start = strchr(staip, '\"');
+    if (start == NULL)
+        return false;
+    start++;
+
+    end = strchr(start, '\"');
+    if (end == NULL || end <= start)
+        return false;
+
+    len = (uint32_t)(end - start);
+    if (len >= ip_size)
+        len = ip_size - 1;
+
+    memcpy(ip, start, len);
+    ip[len] = '\0';
+    return true;
+}
+
+bool esp_at_get_ip(char *ip, uint32_t ip_size)
+{
+    if (!esp_at_write_command("AT+CIFSR", 3000))
+        return false;
+
+    return parse_cifsr_response(esp_at_last_response(), ip, ip_size);
 }
 
 static bool parse_cwstate_response(const char *response, esp_wifi_info_t *info)
 {
-//    AT+CWSTATE?
-//    +CWSTATE:2,"Xiaomi Mi MIX 3_5577"
+    response = strstr(response, "+CWSTATE:");
+    if (response == NULL)
+        return false;
 
-//    OK
-	response = strstr(response, "+CWSTATE:");
-	if (response == NULL)
-		return false;
-	
-	int wifi_state;
-	if (sscanf(response, "+CWSTATE:%d,\"%63[^\"]", &wifi_state, info->ssid) != 2)
-		return false;
-	
-	info->connected = (wifi_state == 2);
-	
-	return true;
+    int wifi_state;
+    if (sscanf(response, "+CWSTATE:%d,\"%63[^\"]", &wifi_state, info->ssid) != 2)
+        return false;
+
+    info->connected = (wifi_state == 2);
+
+    return true;
 }
 
 static bool parse_cwjap_response(const char *response, esp_wifi_info_t *info)
 {
-//    AT+CWJAP?
-//    +CWJAP:"Xiaomi Mi MIX 3_5577","da:b5:3a:e3:2f:60",9,-48,0,1,3,0,1
+    response = strstr(response, "+CWJAP:");
+    if (response == NULL)
+        return false;
 
-//    OK
-	response = strstr(response, "+CWJAP:");
-	if (response == NULL)
-		return false;
-	
-	if (sscanf(response, "+CWJAP:\"%63[^\"]\",\"%17[^\"]\",%d,%d", info->ssid, info->bssid, &info->channel, &info->rssi) != 4)
-		return false;
-	
-	return true;
+    if (sscanf(response, "+CWJAP:\"%63[^\"]\",\"%17[^\"]\",%d,%d", info->ssid, info->bssid, &info->channel, &info->rssi) != 4)
+        return false;
+
+    return true;
 }
 
 bool esp_at_get_wifi_info(esp_wifi_info_t *info)
 {
-    if (!esp_at_write_command("AT+CWSTATE?\r\n", 2000))
+    if (!esp_at_write_command("AT+CWSTATE?", 2000))
         return false;
-    
-    if (!parse_cwstate_response(esp_at_get_response(), info))
+
+    if (!parse_cwstate_response(esp_at_last_response(), info))
         return false;
-    
+
     if (info->connected == true)
     {
-        if (!esp_at_write_command("AT+CWJAP?\r\n", 2000))
+        if (!esp_at_write_command("AT+CWJAP?", 2000))
             return false;
-        
-        if (!parse_cwjap_response(esp_at_get_response(), info))
+
+        if (!parse_cwjap_response(esp_at_last_response(), info))
             return false;
     }
-    
+
     return true;
 }
 
@@ -278,104 +334,100 @@ bool wifi_is_connected(void)
 {
     esp_wifi_info_t info;
     if (esp_at_get_wifi_info(&info))
-    {
         return info.connected;
-    }
     return false;
 }
 
 bool esp_at_sntp_init(void)
 {
-    if (!esp_at_write_command("AT+CIPSNTPCFG=1,8\r\n", 2000))
+    if (!esp_at_write_command("AT+CIPSNTPCFG=1,8", 2000))
         return false;
-    
+
     return true;
 }
 
 static uint8_t month_str_to_num(const char *month_str)
 {
-	const char *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun", 
-		"Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
-	for (uint8_t i = 0; i < 12; i++)
-	{
-		if (strcmp(month_str, months[i]) == 0)
-		{
-			return i + 1;
-		}
-	}
-	return 0;
-}
+    const char *months[] = {"Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"};
 
+    for (uint8_t i = 0; i < 12; i++)
+    {
+        if (strcmp(month_str, months[i]) == 0)
+            return i + 1;
+    }
+
+    return 0;
+}
 
 static uint8_t weekday_str_to_num(const char *weekday_str)
 {
-	const char *weekdays[] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
-	for (uint8_t i = 0; i < 7; i++) {
-		if (strcmp(weekday_str, weekdays[i]) == 0)
-		{
-			return i + 1;
-		}
-	}
-	return 0;
+    const char *weekdays[] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"};
+
+    for (uint8_t i = 0; i < 7; i++)
+    {
+        if (strcmp(weekday_str, weekdays[i]) == 0)
+            return i + 1;
+    }
+
+    return 0;
 }
 
 static bool parse_cipsntptime_response(const char *response, esp_date_time_t *date)
 {
-//	AT+CIPSNTPTIME?
-//	+CIPSNTPTIME:Sun Jul 27 14:07:19 2025
-//	OK
-	char weekday_str[8];
-	char month_str[4];
-	response = strstr(response, "+CIPSNTPTIME:");
-	if (sscanf(response, "+CIPSNTPTIME:%3s %3s %hhu %hhu:%hhu:%hhu %hu", 
-			   weekday_str, month_str, 
-			   &date->day, &date->hour, &date->minute, &date->second, &date->year) != 7)
-		return false;
-	
-	date->weekday = weekday_str_to_num(weekday_str);
-	date->month = month_str_to_num(month_str);
-	
-	return true;
+    char weekday_str[8];
+    char month_str[4];
+
+    response = strstr(response, "+CIPSNTPTIME:");
+    if (response == NULL)
+        return false;
+
+    if (sscanf(response, "+CIPSNTPTIME:%3s %3s %hhu %hhu:%hhu:%hhu %hu",
+               weekday_str, month_str,
+               &date->day, &date->hour, &date->minute, &date->second, &date->year) != 7)
+        return false;
+
+    date->weekday = weekday_str_to_num(weekday_str);
+    date->month = month_str_to_num(month_str);
+
+    return true;
 }
 
 bool esp_at_sntp_get_time(esp_date_time_t *date)
 {
-    if (!esp_at_write_command("AT+CIPSNTPTIME?\r\n", 2000))
+    if (!esp_at_write_command("AT+CIPSNTPTIME?", 2000))
         return false;
-    
-    if (!parse_cipsntptime_response(esp_at_get_response(), date))
+
+    if (!parse_cipsntptime_response(esp_at_last_response(), date))
         return false;
-    
+
     return true;
 }
 
 const char *esp_at_http_get(const char *url)
 {
-//    AT+HTTPCLIENT=2,1,"https://api.seniverse.com/v3/weather/now.json?key=SfRic8Wmp-Qh3OeFk&location=WTEMH46Z5N09&language=en&unit=c",,,2
-//    +HTTPCLIENT:261,{"results":[{"location":{"id":"WTEMH46Z5N09","name":"Hefei","country":"CN","path":"Hefei,Hefei,Anhui,China","timezone":"Asia/Shanghai","timezone_offset":"+08:00"},"now":{"text":"Cloudy","code":"4","temperature":"32"},"last_update":"2025-07-26T16:30:00+08:00"}]}
+    snprintf(txbuf, sizeof(txbuf), "AT+HTTPCLIENT=2,1,\"%s\",,,2", url);
+    if (!esp_at_write_command(txbuf, 5000))
+        return NULL;
 
-//    OK
-    char *txbuf = rxbuf;
-    snprintf(txbuf, sizeof(rxbuf), "AT+HTTPCLIENT=2,1,\"%s\",,,2\r\n", url);
-    bool ret = esp_at_write_command(txbuf, 5000);
-    return ret ? esp_at_get_response() : NULL;
+    return esp_at_last_response();
 }
 
 void USART2_IRQHandler(void)
-{    
+{
     if (USART_GetITStatus(USART2, USART_IT_RXNE) == SET)
     {
         if (rxlen < sizeof(rxbuf) - 1)
         {
-            rxbuf[rxlen++] = USART_ReceiveData(USART2);
+            rxbuf[rxlen++] = (char)USART_ReceiveData(USART2);
             if (rxbuf[rxlen - 1] == '\n')
             {
                 rxbuf[rxlen] = '\0';
                 at_ack_t ack = match_internal_ack(rxline);
                 if (ack != AT_ACK_NONE)
                 {
+                    BaseType_t pxHigherPriorityTaskWoken = pdFALSE;
                     rxack = ack;
-                    BaseType_t pxHigherPriorityTaskWoken;
                     xSemaphoreGiveFromISR(at_ack_sempahore, &pxHigherPriorityTaskWoken);
                     portYIELD_FROM_ISR(pxHigherPriorityTaskWoken);
                 }

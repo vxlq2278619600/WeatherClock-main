@@ -1,0 +1,7 @@
+#ifndef __WIFI_CONFIG_EXAMPLE_H__
+#define __WIFI_CONFIG_EXAMPLE_H__
+
+#define WIFI_SSID     "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+
+#endif /* __WIFI_CONFIG_EXAMPLE_H__ */
