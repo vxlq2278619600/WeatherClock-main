@@ -1,241 +1,171 @@
-# WeatherClock
+# WeatherClock（STM32 天气时钟）
 
-基于 `STM32F407 + FreeRTOS + ST7789 + ESP-AT + AHT20` 的天气时钟练手项目。
+基于 **STM32F407 + FreeRTOS** 的桌面天气时钟。项目通过 ESP32-C3 的 ESP-AT 固件连接 Wi-Fi、同步网络时间并请求高德天气数据，同时使用 AHT20 采集室内温湿度，最终在 2.4 英寸 ST7789 彩屏上显示时间、日期、室内环境和室外天气。
 
-## 最近更新
+> 当前 `app/main.c` 默认启用的是 `ESP-AT` 综合测试流程，适合分阶段检查联网、时间、传感器和天气接口；如需恢复原始应用框架，可调整文件顶部的测试开关。
 
-- 最后更新时间：`2026-07-09 10:59:12 +08:00`
-- 本次更新内容：
-  - 把 WiFi 热点配置从业务逻辑中拆到独立配置头文件
-  - 新增 `wifi_config.example.h` 示例文件，并将真实配置文件加入忽略规则
-  - 扩展 `ESP-AT` 驱动，支持 `ATE0`、热点连接和 `AT+CIFSR` 取 IP
-  - 更新 `ESP AT TEST` 页面，按 `ESP AT -> GMR -> MODE -> WIFI -> IP` 分阶段显示结果
+## 功能概览
 
-## 项目目录
+- ST7789 240 × 320 彩屏界面，支持文字、图片及天气图标
+- AHT20 室内温度、湿度采集
+- ESP32-C3（ESP-AT）连接 2.4 GHz Wi-Fi
+- SNTP 网络校时，并将时间写入 STM32 RTC
+- 通过高德开放平台天气 API 获取城市实况天气
+- 主界面、网络、传感器、天气四个信息页，按下 PA0 可切换页面
+- FreeRTOS 任务、软件定时器及工作队列
+- LCD、AHT20、Wi-Fi/SNTP、ESP-AT 独立测试入口
+- USART1（115200 8N1）调试日志
 
-- `app/`：主流程、页面逻辑、测试入口、WiFi 配置
-- `driver/`：`ST7789`、`AHT20`、`ESP-AT`、`RTC` 等驱动
-- `firmware/`：`CMSIS` 与 `STM32F4xx Standard Peripheral Library`
-- `third_lib/`：`FreeRTOS`
-- `resources/`：图片、字体和设计资源
-- `mdk/`：Keil 工程文件与编译输出
+## 硬件组成
 
-## 硬件接线说明
+| 模块 | 说明 |
+| --- | --- |
+| MCU | STM32F407 |
+| 显示屏 | ST7789，240 × 320，SPI2 |
+| 无线模块 | ESP32-C3，运行 ESP-AT 固件 |
+| 温湿度传感器 | AHT20，I2C1 |
+| 实时时钟 | STM32 内部 RTC |
+| 外部存储 | BL24C512 EEPROM（驱动已包含） |
+| 操作按键 | PA0，高电平按下 |
 
-### ST7789 SPI 屏幕接线
+## 接线说明
 
-| 屏幕引脚 | STM32F407 核心板 |
-| ---- | ---- |
-| GND  | GND  |
-| VCC  | 3V3  |
-| SCL  | PB13 |
-| SDA  | PC3  |
-| RES  | PE3  |
-| DC   | PE4  |
-| CS   | PE2  |
-| BLK  | 3V3  |
+### ST7789 显示屏
 
-### AHT20 接线
+| ST7789 | STM32F407 | 说明 |
+| --- | --- | --- |
+| GND | GND | 地 |
+| VCC | 3V3 | 电源 |
+| SCL / SCK | PB13 | SPI2_SCK |
+| SDA / MOSI | PC3 | SPI2_MOSI |
+| CS | PE2 | 片选 |
+| RES | PE3 | 复位 |
+| DC | PE4 | 数据/命令选择 |
+| BLK | PE5 | 背光控制 |
 
-| AHT20 引脚 | STM32F407 核心板 |
-| ---- | ---- |
-| VIN  | 3V3  |
-| GND  | GND  |
-| SCL  | PB10 |
-| SDA  | PB11 |
+### AHT20
 
-### ESP32-C3 ESP-AT 接线
+| AHT20 | STM32F407 |
+| --- | --- |
+| VIN | 3V3 |
+| GND | GND |
+| SCL | PB6 / I2C1_SCL |
+| SDA | PB7 / I2C1_SDA |
 
-| ESP32-C3 | STM32F407 核心板 |
-| ---- | ---- |
+### ESP32-C3（ESP-AT）
+
+| ESP32-C3 | STM32F407 |
+| --- | --- |
 | GND | GND |
 | GPIO6 / AT_RX | PA2 / USART2_TX |
 | GPIO7 / AT_TX | PA3 / USART2_RX |
 
-### 供电说明
+串口参数为 `115200 8N1`，无校验、无流控。ESP32-C3 可使用 USB-C 独立供电，但必须与 STM32 共地；请根据模块规格确认供电方式，不要同时从多个电源端反向供电。
 
-- 当前 `ESP32-C3` 使用 `USB-C` 单独供电
-- `STM32F407` 核心板单独供电
-- 两边目前只共 `GND`
-- 当前阶段不要再从 STM32 核心板 `5V` 给 `ESP32-C3` 供电
+## 软件结构
 
-### 引脚说明
+```text
+WeatherClock-main/
+├─ app/                 应用入口、业务流程、页面、字体及图片数据
+│  ├─ page/             欢迎页、主页、Wi-Fi 页和错误页
+│  ├─ font/             点阵字体资源
+│  └─ image/            天气图标及界面图片
+├─ driver/              ST7789、ESP-AT、AHT20、RTC、EEPROM 等驱动
+├─ firmware/            CMSIS 与 STM32F4 标准外设库
+├─ third_lib/freertos/  FreeRTOS 内核及移植层
+├─ resources/           原始图片、界面设计稿
+├─ tools/               中文字体转换工具
+└─ mdk/                 Keil MDK 工程文件
+```
 
-- `ST7789 SCL` 是 `SPI SCK`，不是 `I2C SCL`
-- `ST7789 SDA` 是 `SPI MOSI`，不是 `I2C SDA`
-- `BLK` 当前固定接 `3V3`，背光常亮，便于排查显示内容
-- `ESP32-C3` 当前与 STM32 通信的有效引脚是 `GPIO6/GPIO7`
-- `GPIO20/GPIO21` 不再作为当前项目的 STM32 通信接线使用
-- STM32 端固定使用 `USART2`，其中 `PA2` 为 `TX`，`PA3` 为 `RX`
-- 所有 `AT` 命令都必须以 `\r\n` 结尾
+主要数据流程：
 
-## 调试结论
+```text
+AHT20 ──I2C──> STM32F407 ──SPI──> ST7789
+                         │
+                         └─USART2──> ESP32-C3 ──Wi-Fi──> SNTP / 高德天气 API
+```
 
-### 屏幕部分
+## 快速开始
 
-- 当前项目代码使用 `PB13` 作为 `SPI` 时钟线，使用 `PC3` 作为 `SPI` 数据线
-- `ST7789` 基础自检已经通过，黑、白、红、绿、蓝页面显示正常
-- 英文、数字和简单图形显示正常
-- 说明 `SPI` 通信、屏幕初始化、`RES/DC/CS` 控制线和基础显示方向已验证通过
+### 1. 准备开发环境
 
-### 传感器部分
+- Keil MDK-ARM 5
+- 支持 STM32F407 的 Device Pack
+- ST-Link 或兼容下载器
+- 已刷入 ESP-AT 固件的 ESP32-C3
+- 可用的 2.4 GHz Wi-Fi 或手机热点
 
-- `AHT20` 当前已调通
-- 但本阶段不对 `AHT20` 做修改
+### 2. 配置 Wi-Fi
 
-### ESP-AT 部分
-
-- 当前 `ESP32-C3` 已烧录 `ESP-AT` 固件
-- 串口助手测试 `AT` 已返回 `OK`
-- 串口助手测试 `AT+GMR` 已返回版本信息
-- 当前与 STM32 通信的连接以 `GPIO6/GPIO7 <-> PA2/PA3` 为准
-- STM32 端驱动使用 `USART2 115200 8N1`，无校验、1 位停止位、无流控
-
-### 当前阶段目标
-
-本阶段只验证：
-
-- `ESP32-C3 ESP-AT` 成功连接手机热点
-- 成功获取 IP 地址
-- 屏幕与串口都能看到每一步结果
-
-## WiFi 配置说明
-
-当前热点配置文件位于：
-
-- [`app/wifi_config.h`](/D:/1_codingSoftware/4_Keil_v5/Projects/WeatherClock-main/WeatherClock-main/app/wifi_config.h)
-- [`app/wifi_config.example.h`](/D:/1_codingSoftware/4_Keil_v5/Projects/WeatherClock-main/WeatherClock-main/app/wifi_config.example.h)
-
-当前格式为：
+复制 `app/wifi_config.example.h` 为 `app/wifi_config.h`，填写实际热点信息：
 
 ```c
 #define WIFI_SSID     "YOUR_WIFI_SSID"
 #define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
 ```
 
-说明：
+### 3. 配置天气服务
 
-- `wifi_config.h` 用于本地真实配置
-- `wifi_config.example.h` 用于示例和仓库共享
-- `.gitignore` 已忽略 `app/wifi_config.h`
-- 上传代码前请确认不要提交真实热点名称和密码
+在高德开放平台创建 **Web 服务** Key，然后复制 `app/weather_config.example.h` 为 `app/weather_config.h`：
 
-## 当前可切换测试入口
-
-当前在 [`app/main.c`](/D:/1_codingSoftware/4_Keil_v5/Projects/WeatherClock-main/WeatherClock-main/app/main.c) 中保留了四个独立测试开关：
-
-- `ENABLE_LCD_SELF_TEST`
-- `ENABLE_AHT20_LCD_TEST`
-- `ENABLE_WIFI_SNTP_LCD_TEST`
-- `ENABLE_ESP_AT_BASIC_TEST`
-
-建议当前阶段配置：
-
-- `ENABLE_LCD_SELF_TEST = 0`
-- `ENABLE_AHT20_LCD_TEST = 0`
-- `ENABLE_WIFI_SNTP_LCD_TEST = 0`
-- `ENABLE_ESP_AT_BASIC_TEST = 1`
-
-这样上电后会直接进入 `ESP AT TEST` 页面，先跑：
-
-- `AT`
-- `AT+GMR`
-- `ATE0`
-- `AT+CWMODE=1`
-- `AT+CWJAP="WIFI_SSID","WIFI_PASSWORD"`
-- `AT+CIFSR`
-
-## 当前实现状态
-
-### 已完成
-
-- `FreeRTOS` 主框架可启动
-- `ST7789` 屏幕已调通
-- 屏幕基础自检正常
-- `AHT20` 温湿度读取正常
-- `ESP32-C3 ESP-AT` 基础串口测试已通过
-- `ESP32-C3` 热点连接与取 IP 测试入口已接入
-
-### 当前屏幕显示目标
-
-烧录后，屏幕应分阶段显示：
-
-- `ESP AT: OK`
-- `GMR: OK`
-- `MODE: OK`
-- `WIFI: OK`
-- `IP: xxx.xxx.xxx.xxx`
-
-如果失败，屏幕会在进度行显示明确阶段，例如：
-
-- `ATE0 FAIL`
-- `MODE FAIL`
-- `WIFI FAIL`
-- `IP FAIL`
-
-### 当前串口日志目标
-
-串口应看到类似日志：
-
-```text
-[ESP TEST] start
-[ESP TEST] UART2 init: 115200 8N1
-[ESP TEST] STM32 PA2 / USART2_TX -> ESP32-C3 GPIO6 / AT_RX
-[ESP TEST] STM32 PA3 / USART2_RX -> ESP32-C3 GPIO7 / AT_TX
-[ESP TEST] wait ESP boot...
-[ESP TEST] Send: AT
-[ESP TEST] Response:
-OK
-[ESP TEST] Send: AT+GMR
-[ESP TEST] Response:
-AT version:4.1.1.0
-SDK version:v5.4.1
-Bin version:v4.1.0(MINI-1)
-OK
-[ESP TEST] Send: ATE0
-[ESP TEST] Response:
-OK
-[ESP TEST] Send: AT+CWMODE=1
-[ESP TEST] Response:
-OK
-[ESP TEST] Send: AT+CWJAP="你的热点名","******"
-[ESP TEST] Response:
-...
-[ESP TEST] WIFI JOIN OK
-[ESP TEST] Send: AT+CIFSR
-[ESP TEST] Response:
-...
-[ESP TEST] IP OK
-[ESP TEST] IP: xxx.xxx.xxx.xxx
+```c
+#define WEATHER_API_KEY       "YOUR_AMAP_WEB_SERVICE_KEY"
+#define WEATHER_CITY_ADCODE   "610100"
+#define WEATHER_CITY_NAME     "Xi'an"
 ```
 
-## 手机热点注意事项
+`WEATHER_CITY_ADCODE` 应填写目标城市的行政区划代码。当前天气请求默认使用 `restapi.amap.com` 的 HTTP 接口；如需 SSL，可在构建配置中定义 `WEATHER_USE_SSL=1`，并确保 ESP-AT 固件支持相应连接。
 
-- 热点名称建议先用英文或数字
-- 热点密码建议先用英文或数字
-- 手机热点建议优先开启 `2.4GHz` 或兼容模式
-- 如果热点名或密码包含特殊字符，建议先改成简单版本再测试
+`wifi_config.h` 与 `weather_config.h` 已加入 `.gitignore`，上传仓库前请勿把真实 SSID、密码或 API Key 写入示例文件。
 
-## 常见注意事项
+### 4. 选择运行模式
 
-- 背光亮不代表屏幕通信成功，必须看到颜色、文字或图形才算链路正常
-- 如果当前只做 `ESP-AT` 测试失败，优先检查 `GND` 是否共地、`PA2->GPIO6`、`PA3->GPIO7` 是否交叉正确
-- 如果 `WIFI JOIN FAIL`，优先检查热点是否开启、是否是 `2.4GHz`、热点名和密码是否正确
-- 如果 `IP FAIL`，优先检查热点是否真的分配了地址，或者 `AT+CIFSR` 响应格式是否和当前固件版本一致
-- 后续继续改代码前，建议保留当前“屏幕正常、AT 通信正常、热点连接可测”的版本作为稳定回退点
+在 `app/main.c` 顶部配置以下开关，同一时间建议只启用一种测试：
 
-## 下一步计划
+| 开关 | 用途 |
+| --- | --- |
+| `ENABLE_LCD_SELF_TEST` | LCD 颜色、文字和图形自检 |
+| `ENABLE_AHT20_LCD_TEST` | AHT20 温湿度显示测试 |
+| `ENABLE_WIFI_SNTP_LCD_TEST` | Wi-Fi、SNTP 与 RTC 测试 |
+| `ENABLE_ESP_AT_BASIC_TEST` | ESP-AT 联网综合测试 |
 
-- 先确认 `ESP32-C3` 连接热点并成功获取 IP
-- 再打开 `ENABLE_WIFI_SNTP_LCD_TEST`，继续验证 `WiFi + SNTP`
-- 最后再恢复完整天气时钟主流程和天气 API 测试
+仓库当前默认配置为：
 
-## 参考视频
+```c
+#define ENABLE_LCD_SELF_TEST       0
+#define ENABLE_AHT20_LCD_TEST      0
+#define ENABLE_WIFI_SNTP_LCD_TEST  0
+#define ENABLE_ESP_AT_BASIC_TEST   1
+```
 
-[【全开源手把手项目实战】基于 FreeRTOS 的 STM32 智能天气时钟](https://www.bilibili.com/video/BV1tfL1zeEQN)
+该模式会依次检查 AT 通信、固件版本、Wi-Fi 连接、IP、SNTP、AHT20 和天气接口；运行后短按 PA0 可切换信息页。
 
-## 联系方式
+### 5. 编译与烧录
 
-添加 UP 主微信，获取完整项目资料和学习路线，进交流群讨论项目内容。
+1. 使用 Keil 打开 `mdk/stm32f407.uvprojx`。
+2. 确认目标芯片、下载器及本地配置头文件已就绪。
+3. Build 工程并通过 ST-Link 下载到开发板。
+4. 打开 USART1 串口终端，使用 `115200 8N1` 查看运行日志。
 
-![vxcode](docs/image/vxcode.jpg)
+## 界面与资源
+
+`resources/design/` 中保存了欢迎页、主页、Wi-Fi 连接页和错误页设计稿；`resources/images/` 保存原始图像，转换后的 C 数组位于 `app/image/`。天气图标覆盖晴、夜间、多云、阴、雨、雷雨、雪及未知状态。
+
+## 常见问题
+
+- **屏幕背光亮但无内容**：检查 PB13、PC3、PE2～PE5 接线；背光亮不代表 SPI 通信成功。
+- **ESP-AT 无响应**：确认 PA2 接 GPIO6、PA3 接 GPIO7，TX/RX 已交叉连接且两块板共地。
+- **Wi-Fi 连接失败**：优先使用 2.4 GHz 热点，并用简单的英文/数字 SSID 和密码排除转义问题。
+- **SNTP 失败**：先确认模块已取得 IP，再检查网络是否允许访问时间服务器。
+- **天气请求失败**：检查 Web 服务 Key、城市 adcode、网络状态及串口中的 HTTP 响应。
+- **AHT20 初始化失败**：确认源码当前使用 PB6/PB7，而不是其他 I2C2 引脚，并检查 3.3 V 供电。
+- **编译提示缺少配置文件**：从两个 `.example.h` 文件复制生成本地配置文件。
+
+## 当前状态
+
+目前已具备 LCD、AHT20、ESP-AT、Wi-Fi、SNTP/RTC、高德实况天气和多页面显示代码，并保留了便于硬件逐项排查的测试模式。项目仍属于开发与调试阶段，实际稳定性会受到 ESP-AT 固件版本、网络环境、模块供电及硬件接线影响。
+
+## License
+
+本项目许可证见 [LICENSE](LICENSE)。
